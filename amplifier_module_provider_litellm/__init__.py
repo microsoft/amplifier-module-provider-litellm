@@ -13,3 +13,9 @@ Usage as an Amplifier module:
 """
 
 __version__ = "0.1.0"
+
+# Module metadata and mount() must be importable from __init__ for the
+# Amplifier module loader to discover them.
+from amplifier_module_provider_litellm.module import mount, __amplifier_module_type__
+
+__all__ = ["mount", "__amplifier_module_type__", "__version__"]
