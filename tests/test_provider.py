@@ -27,12 +27,18 @@ class TestProviderInit:
         assert p.default_model == "anthropic/claude-opus-4-6"
         assert p._timeout == 300.0
         assert p._drop_params is True
+        assert p.coordinator is None
 
     def test_custom_config(self):
         p = LiteLLMProvider({"model": "openai/gpt-4o", "timeout": 60, "drop_params": False})
         assert p.default_model == "openai/gpt-4o"
         assert p._timeout == 60.0
         assert p._drop_params is False
+
+    def test_coordinator_passed(self):
+        coord = MagicMock()
+        p = LiteLLMProvider(coordinator=coord)
+        assert p.coordinator is coord
 
 
 class TestProviderInfo:
@@ -43,12 +49,12 @@ class TestProviderInfo:
         assert "tools" in info.capabilities
         assert "streaming" in info.capabilities
         assert info.credential_env_vars == []
+        assert len(info.config_fields) >= 1
 
 
 class TestListModels:
     @pytest.mark.asyncio
     async def test_lists_models_for_set_env_vars(self):
-        # Use a controlled env to avoid inheriting real keys
         controlled_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
         controlled_env["ANTHROPIC_API_KEY"] = "test"
         controlled_env["OPENAI_API_KEY"] = "test"
@@ -58,7 +64,6 @@ class TestListModels:
             ids = [m.id for m in models]
             assert any("anthropic" in mid for mid in ids)
             assert any("openai" in mid for mid in ids)
-            # No Gemini key → no Gemini models
             assert not any("gemini" in mid for mid in ids)
 
     @pytest.mark.asyncio
@@ -222,11 +227,19 @@ class TestComplete:
         request.model = "openai/gpt-4o"
         request.messages = []
         request.tools = None
-        request.max_tokens = 100
+        request.max_output_tokens = 100
         request.temperature = 0.0
 
         with patch("amplifier_module_provider_litellm.provider.litellm") as mock_litellm:
             mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+            # Patch error classes to exist on the mock
+            mock_litellm.AuthenticationError = Exception
+            mock_litellm.RateLimitError = Exception
+            mock_litellm.ContextWindowExceededError = Exception
+            mock_litellm.ContentPolicyViolationError = Exception
+            mock_litellm.BadRequestError = Exception
+            mock_litellm.ServiceUnavailableError = Exception
+            mock_litellm.Timeout = Exception
             result = await provider.complete(request)
 
             mock_litellm.acompletion.assert_called_once()

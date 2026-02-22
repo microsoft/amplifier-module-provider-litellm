@@ -27,6 +27,8 @@ class TestMount:
         assert args[0] == "providers"
         assert kwargs["name"] == "litellm"
         assert args[1].name == "litellm"
+        # Verify coordinator is passed through
+        assert args[1].coordinator is coordinator
 
     @pytest.mark.asyncio
     async def test_mounts_with_custom_config(self):
