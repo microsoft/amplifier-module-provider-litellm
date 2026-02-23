@@ -342,7 +342,18 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
             entry["content"] = content
         elif isinstance(content, list):
             # Multi-part content (text + images)
-            entry["content"] = content
+            # Serialize Pydantic models to dicts — the loop module may store
+            # content blocks as TextBlock/ToolCallBlock objects, but litellm
+            # expects plain dicts or strings.
+            serialized = []
+            for block in content:
+                if hasattr(block, "model_dump"):
+                    serialized.append(block.model_dump())
+                elif isinstance(block, dict):
+                    serialized.append(block)
+                else:
+                    serialized.append(str(block))
+            entry["content"] = serialized
         else:
             entry["content"] = str(content) if content else ""
 

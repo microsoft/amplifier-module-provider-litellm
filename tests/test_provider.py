@@ -124,6 +124,30 @@ class TestToLiteLLMMessages:
         assert result[0]["tool_calls"][0]["function"]["name"] == "search"
 
 
+    def test_assistant_with_pydantic_content_blocks(self):
+        """Content blocks stored as Pydantic objects must be serialized to dicts.
+
+        Regression test: the loop module stores assistant message content as
+        TextBlock/ToolCallBlock Pydantic models. Without serialization, litellm
+        crashes with "'TextBlock' object has no attribute 'get'".
+        """
+        from amplifier_core.message_models import TextBlock
+
+        request = MagicMock()
+        msg = MagicMock()
+        msg.role = "assistant"
+        msg.content = [TextBlock(text="Hello world")]
+        msg.tool_call_id = None
+        msg.tool_calls = None
+        request.messages = [msg]
+
+        result = _to_litellm_messages(request)
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert isinstance(content[0], dict)
+        assert content[0]["text"] == "Hello world"
+
+
 class TestToLiteLLMTools:
     def test_converts_tools(self):
         request = MagicMock()
