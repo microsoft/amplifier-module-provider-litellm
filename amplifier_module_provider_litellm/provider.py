@@ -358,18 +358,27 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
             entry["content"] = str(content) if content else ""
 
         # Preserve tool_calls on assistant messages
+        # Tool calls may be ToolCall objects OR plain dicts (from context storage)
         if role == "assistant" and msg.tool_calls:
-            entry["tool_calls"] = [
-                {
-                    "id": tc.id or "",
+            normalized_tcs = []
+            for tc in msg.tool_calls:
+                if isinstance(tc, dict):
+                    tc_id = tc.get("id", "")
+                    tc_name = tc.get("name") or tc.get("tool", "")
+                    tc_args = tc.get("arguments") or {}
+                else:
+                    tc_id = tc.id or ""
+                    tc_name = getattr(tc, "name", None) or getattr(tc, "tool", "") or ""
+                    tc_args = tc.arguments if tc.arguments is not None else {}
+                normalized_tcs.append({
+                    "id": tc_id,
                     "type": "function",
                     "function": {
-                        "name": tc.name or tc.tool or "",
-                        "arguments": json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else str(tc.arguments or "{}"),
+                        "name": tc_name,
+                        "arguments": json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args or "{}"),
                     },
-                }
-                for tc in msg.tool_calls
-            ]
+                })
+            entry["tool_calls"] = normalized_tcs
 
         messages.append(entry)
 
