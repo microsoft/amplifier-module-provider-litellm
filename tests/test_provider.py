@@ -343,11 +343,11 @@ def _make_provider_and_request():
     return provider, request
 
 
-def _patch_litellm_error_classes(mock_litellm, target_cls):
+def _patch_litellm_error_classes(mock_litellm):
     """Assign all litellm error classes so the except chain works.
 
-    *target_cls* is the class to use for the error we want to trigger;
-    all others are set to a unique type that will never match.
+    Every class is set to a unique type that will never match, so the
+    caller can then override the one it actually wants to trigger.
     """
 
     class _Never(Exception):
@@ -374,7 +374,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             AuthErr = type("AuthenticationError", (_FakeError,), {})
             mock_litellm.AuthenticationError = AuthErr
             mock_litellm.acompletion = AsyncMock(
@@ -398,7 +398,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             RateErr = type("RateLimitError", (_FakeError,), {})
             mock_litellm.RateLimitError = RateErr
             mock_litellm.acompletion = AsyncMock(
@@ -420,7 +420,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             CtxErr = type("ContextWindowExceededError", (_FakeError,), {})
             mock_litellm.ContextWindowExceededError = CtxErr
             mock_litellm.acompletion = AsyncMock(
@@ -444,7 +444,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             PolicyErr = type("ContentPolicyViolationError", (_FakeError,), {})
             mock_litellm.ContentPolicyViolationError = PolicyErr
             mock_litellm.acompletion = AsyncMock(
@@ -468,7 +468,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             BadReqErr = type("BadRequestError", (_FakeError,), {})
             mock_litellm.BadRequestError = BadReqErr
             mock_litellm.acompletion = AsyncMock(
@@ -492,7 +492,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             SvcErr = type("ServiceUnavailableError", (_FakeError,), {})
             mock_litellm.ServiceUnavailableError = SvcErr
             mock_litellm.acompletion = AsyncMock(
@@ -516,7 +516,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             exc = _FakeError("str repr", body=body)
             mock_litellm.acompletion = AsyncMock(side_effect=exc)
 
@@ -535,7 +535,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             AuthErr = type("AuthenticationError", (_FakeError,), {})
             mock_litellm.AuthenticationError = AuthErr
             mock_litellm.acompletion = AsyncMock(
@@ -559,7 +559,7 @@ class TestErrorMessageUsesJsonBody:
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
         ) as mock_litellm:
-            _patch_litellm_error_classes(mock_litellm, None)
+            _patch_litellm_error_classes(mock_litellm)
             mock_litellm.acompletion = AsyncMock(
                 side_effect=RuntimeError("plain error")
             )

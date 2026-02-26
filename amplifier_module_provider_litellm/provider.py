@@ -247,7 +247,7 @@ class LiteLLMProvider:
                 return await litellm.acompletion(**litellm_kwargs)
             except litellm.AuthenticationError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelAuthenticationError(
                     msg,
                     provider="litellm",
@@ -255,7 +255,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.RateLimitError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelRateLimitError(
                     msg,
                     provider="litellm",
@@ -264,7 +264,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.ContextWindowExceededError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelContextLengthError(
                     msg,
                     provider="litellm",
@@ -272,7 +272,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.ContentPolicyViolationError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelContentFilterError(
                     msg,
                     provider="litellm",
@@ -280,7 +280,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.BadRequestError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelInvalidRequestError(
                     msg,
                     provider="litellm",
@@ -288,7 +288,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.ServiceUnavailableError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body) if body is not None else str(e)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelProviderUnavailableError(
                     msg,
                     provider="litellm",
@@ -306,7 +306,7 @@ class LiteLLMProvider:
             except Exception as e:
                 body = getattr(e, "body", None)
                 error_msg = (
-                    json.dumps(body)
+                    json.dumps(body, default=str)
                     if body is not None
                     else (str(e) or f"{type(e).__name__}: (no message)")
                 )
