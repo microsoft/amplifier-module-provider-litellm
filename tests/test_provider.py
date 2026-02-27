@@ -20,6 +20,7 @@ from amplifier_module_provider_litellm.provider import (
 # Provider basics
 # ---------------------------------------------------------------------------
 
+
 class TestProviderInit:
     def test_defaults(self):
         p = LiteLLMProvider()
@@ -30,7 +31,9 @@ class TestProviderInit:
         assert p.coordinator is None
 
     def test_custom_config(self):
-        p = LiteLLMProvider({"model": "openai/gpt-4o", "timeout": 60, "drop_params": False})
+        p = LiteLLMProvider(
+            {"model": "openai/gpt-4o", "timeout": 60, "drop_params": False}
+        )
         assert p.default_model == "openai/gpt-4o"
         assert p._timeout == 60.0
         assert p._drop_params is False
@@ -55,7 +58,10 @@ class TestProviderInfo:
 class TestListModels:
     @pytest.mark.asyncio
     async def test_lists_models_for_set_env_vars(self):
-        controlled_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        controlled_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+        }
         controlled_env["ANTHROPIC_API_KEY"] = "test"
         controlled_env["OPENAI_API_KEY"] = "test"
         with patch.dict(os.environ, controlled_env, clear=True):
@@ -78,6 +84,7 @@ class TestListModels:
 # ---------------------------------------------------------------------------
 # Message serialization
 # ---------------------------------------------------------------------------
+
 
 class TestToLiteLLMMessages:
     def test_simple_user_message(self):
@@ -122,7 +129,6 @@ class TestToLiteLLMMessages:
         result = _to_litellm_messages(request)
         assert "tool_calls" in result[0]
         assert result[0]["tool_calls"][0]["function"]["name"] == "search"
-
 
     def test_assistant_with_pydantic_content_blocks(self):
         """Content blocks stored as Pydantic objects must be serialized to dicts.
@@ -172,6 +178,7 @@ class TestToLiteLLMTools:
 # ---------------------------------------------------------------------------
 # Response deserialization
 # ---------------------------------------------------------------------------
+
 
 class TestFromLiteLLMResponse:
     def test_text_response(self):
@@ -230,6 +237,7 @@ class TestFromLiteLLMResponse:
 # Complete (mocked litellm call)
 # ---------------------------------------------------------------------------
 
+
 class TestComplete:
     @pytest.mark.asyncio
     async def test_complete_calls_litellm(self):
@@ -254,7 +262,9 @@ class TestComplete:
         request.max_output_tokens = 100
         request.temperature = 0.0
 
-        with patch("amplifier_module_provider_litellm.provider.litellm") as mock_litellm:
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
             mock_litellm.acompletion = AsyncMock(return_value=mock_response)
             # Patch error classes to exist on the mock
             mock_litellm.AuthenticationError = Exception
@@ -277,6 +287,7 @@ class TestComplete:
 # ---------------------------------------------------------------------------
 # Parse tool calls
 # ---------------------------------------------------------------------------
+
 
 class TestParseToolCalls:
     def test_filters_none_arguments(self):
@@ -305,3 +316,257 @@ class TestParseToolCalls:
         response = MagicMock()
         response.tool_calls = None
         assert provider.parse_tool_calls(response) == []
+
+
+# ---------------------------------------------------------------------------
+# Error message uses json.dumps(e.body) instead of str(e)
+# ---------------------------------------------------------------------------
+
+
+class _FakeError(Exception):
+    """Exception with a .body attribute, mimicking litellm error structure."""
+
+    def __init__(self, message, body=None):
+        super().__init__(message)
+        self.body = body
+
+
+def _make_provider_and_request():
+    """Helper: build a LiteLLMProvider and a minimal ChatRequest mock."""
+    provider = LiteLLMProvider({"model": "openai/gpt-4o"})
+    request = MagicMock()
+    request.model = "openai/gpt-4o"
+    request.messages = []
+    request.tools = None
+    request.max_output_tokens = 100
+    request.temperature = 0.0
+    return provider, request
+
+
+def _patch_litellm_error_classes(mock_litellm):
+    """Assign all litellm error classes so the except chain works.
+
+    Every class is set to a unique type that will never match, so the
+    caller can then override the one it actually wants to trigger.
+    """
+
+    class _Never(Exception):
+        pass
+
+    mock_litellm.AuthenticationError = _Never
+    mock_litellm.RateLimitError = _Never
+    mock_litellm.ContextWindowExceededError = _Never
+    mock_litellm.ContentPolicyViolationError = _Never
+    mock_litellm.BadRequestError = _Never
+    mock_litellm.ServiceUnavailableError = _Never
+    mock_litellm.Timeout = _Never
+    return mock_litellm
+
+
+class TestErrorMessageUsesJsonBody:
+    """Verify that all 7 targeted except blocks use json.dumps(e.body)."""
+
+    @pytest.mark.asyncio
+    async def test_auth_error_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "invalid api key", "type": "auth_error", "code": 401}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            AuthErr = type("AuthenticationError", (_FakeError,), {})
+            mock_litellm.AuthenticationError = AuthErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=AuthErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import (
+                AuthenticationError as KernelAuthenticationError,
+            )
+
+            with pytest.raises(KernelAuthenticationError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_error_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "rate limited", "type": "rate_limit", "code": 429}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            RateErr = type("RateLimitError", (_FakeError,), {})
+            mock_litellm.RateLimitError = RateErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=RateErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+
+            with pytest.raises(KernelRateLimitError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_context_window_error_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "context window exceeded", "code": 400}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            CtxErr = type("ContextWindowExceededError", (_FakeError,), {})
+            mock_litellm.ContextWindowExceededError = CtxErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=CtxErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import (
+                ContextLengthError as KernelContextLengthError,
+            )
+
+            with pytest.raises(KernelContextLengthError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_content_policy_error_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "content policy violation", "code": 400}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            PolicyErr = type("ContentPolicyViolationError", (_FakeError,), {})
+            mock_litellm.ContentPolicyViolationError = PolicyErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=PolicyErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import (
+                ContentFilterError as KernelContentFilterError,
+            )
+
+            with pytest.raises(KernelContentFilterError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_bad_request_error_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "bad request", "code": 400}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            BadReqErr = type("BadRequestError", (_FakeError,), {})
+            mock_litellm.BadRequestError = BadReqErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=BadReqErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import (
+                InvalidRequestError as KernelInvalidRequestError,
+            )
+
+            with pytest.raises(KernelInvalidRequestError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_service_unavailable_error_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "service unavailable", "code": 503}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeError,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_uses_json_body(self):
+        provider, request = _make_provider_and_request()
+        body = {"message": "unexpected error", "code": 500}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            exc = _FakeError("str repr", body=body)
+            mock_litellm.acompletion = AsyncMock(side_effect=exc)
+
+            from amplifier_core.llm_errors import LLMError as KernelLLMError
+
+            with pytest.raises(KernelLLMError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_auth_error_falls_back_to_str_when_no_body(self):
+        """When e.body is None, falls back to str(e)."""
+        provider, request = _make_provider_and_request()
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            AuthErr = type("AuthenticationError", (_FakeError,), {})
+            mock_litellm.AuthenticationError = AuthErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=AuthErr("fallback string msg", body=None)
+            )
+
+            from amplifier_core.llm_errors import (
+                AuthenticationError as KernelAuthenticationError,
+            )
+
+            with pytest.raises(KernelAuthenticationError) as exc_info:
+                await provider.complete(request)
+
+            assert "fallback string msg" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_falls_back_to_str_when_no_body_attr(self):
+        """When e has no .body attribute at all, falls back to str(e)."""
+        provider, request = _make_provider_and_request()
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=RuntimeError("plain error")
+            )
+
+            from amplifier_core.llm_errors import LLMError as KernelLLMError
+
+            with pytest.raises(KernelLLMError) as exc_info:
+                await provider.complete(request)
+
+            assert "plain error" in str(exc_info.value)

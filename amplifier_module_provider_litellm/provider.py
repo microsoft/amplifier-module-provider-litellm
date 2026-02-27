@@ -115,50 +115,83 @@ class LiteLLMProvider:
 
         # Provider -> (env_var, [(model_id, display_name, context_window, max_output)])
         provider_models = [
-            ("ANTHROPIC_API_KEY", [
-                ("anthropic/claude-opus-4-6", "Claude Opus 4", 200_000, 128_000),
-                ("anthropic/claude-sonnet-4-20250514", "Claude Sonnet 4", 200_000, 64_000),
-            ]),
-            ("OPENAI_API_KEY", [
-                ("openai/gpt-4o", "GPT-4o", 128_000, 16_384),
-                ("openai/gpt-4o-mini", "GPT-4o Mini", 128_000, 16_384),
-                ("openai/o3", "o3", 200_000, 100_000),
-            ]),
-            ("GEMINI_API_KEY", [
-                ("gemini/gemini-2.5-pro", "Gemini 2.5 Pro", 1_000_000, 64_000),
-                ("gemini/gemini-2.5-flash", "Gemini 2.5 Flash", 1_000_000, 64_000),
-            ]),
-            ("XAI_API_KEY", [
-                ("xai/grok-3", "Grok 3", 131_072, 16_384),
-            ]),
-            ("GROQ_API_KEY", [
-                ("groq/llama-3.3-70b-versatile", "Llama 3.3 70B (Groq)", 128_000, 32_000),
-            ]),
-            ("OPENROUTER_API_KEY", [
-                ("openrouter/auto", "OpenRouter Auto", 200_000, 64_000),
-            ]),
+            (
+                "ANTHROPIC_API_KEY",
+                [
+                    ("anthropic/claude-opus-4-6", "Claude Opus 4", 200_000, 128_000),
+                    (
+                        "anthropic/claude-sonnet-4-20250514",
+                        "Claude Sonnet 4",
+                        200_000,
+                        64_000,
+                    ),
+                ],
+            ),
+            (
+                "OPENAI_API_KEY",
+                [
+                    ("openai/gpt-4o", "GPT-4o", 128_000, 16_384),
+                    ("openai/gpt-4o-mini", "GPT-4o Mini", 128_000, 16_384),
+                    ("openai/o3", "o3", 200_000, 100_000),
+                ],
+            ),
+            (
+                "GEMINI_API_KEY",
+                [
+                    ("gemini/gemini-2.5-pro", "Gemini 2.5 Pro", 1_000_000, 64_000),
+                    ("gemini/gemini-2.5-flash", "Gemini 2.5 Flash", 1_000_000, 64_000),
+                ],
+            ),
+            (
+                "XAI_API_KEY",
+                [
+                    ("xai/grok-3", "Grok 3", 131_072, 16_384),
+                ],
+            ),
+            (
+                "GROQ_API_KEY",
+                [
+                    (
+                        "groq/llama-3.3-70b-versatile",
+                        "Llama 3.3 70B (Groq)",
+                        128_000,
+                        32_000,
+                    ),
+                ],
+            ),
+            (
+                "OPENROUTER_API_KEY",
+                [
+                    ("openrouter/auto", "OpenRouter Auto", 200_000, 64_000),
+                ],
+            ),
         ]
 
         for env_var, model_list in provider_models:
             if os.environ.get(env_var):
                 for mid, display, ctx, max_out in model_list:
-                    models.append(ModelInfo(
-                        id=mid,
-                        display_name=display,
-                        context_window=ctx,
-                        max_output_tokens=max_out,
-                        capabilities=["tools", "streaming"],
-                    ))
+                    models.append(
+                        ModelInfo(
+                            id=mid,
+                            display_name=display,
+                            context_window=ctx,
+                            max_output_tokens=max_out,
+                            capabilities=["tools", "streaming"],
+                        )
+                    )
 
         # Always include default model if not already listed
         if not any(m.id == self.default_model for m in models):
-            models.insert(0, ModelInfo(
-                id=self.default_model,
-                display_name=self.default_model,
-                context_window=200_000,
-                max_output_tokens=64_000,
-                capabilities=["tools", "streaming"],
-            ))
+            models.insert(
+                0,
+                ModelInfo(
+                    id=self.default_model,
+                    display_name=self.default_model,
+                    context_window=200_000,
+                    max_output_tokens=64_000,
+                    capabilities=["tools", "streaming"],
+                ),
+            )
 
         return models
 
@@ -201,7 +234,9 @@ class LiteLLMProvider:
 
         logger.info(
             "litellm complete: model=%s, messages=%d, tools=%d",
-            model, len(messages), len(tools or []),
+            model,
+            len(messages),
+            len(tools or []),
         )
 
         start_time = time.time()
@@ -211,40 +246,74 @@ class LiteLLMProvider:
             try:
                 return await litellm.acompletion(**litellm_kwargs)
             except litellm.AuthenticationError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelAuthenticationError(
-                    str(e), provider="litellm", status_code=401,
+                    msg,
+                    provider="litellm",
+                    status_code=401,
                 ) from e
             except litellm.RateLimitError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelRateLimitError(
-                    str(e), provider="litellm", status_code=429, retryable=True,
+                    msg,
+                    provider="litellm",
+                    status_code=429,
+                    retryable=True,
                 ) from e
             except litellm.ContextWindowExceededError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelContextLengthError(
-                    str(e), provider="litellm", status_code=400,
+                    msg,
+                    provider="litellm",
+                    status_code=400,
                 ) from e
             except litellm.ContentPolicyViolationError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelContentFilterError(
-                    str(e), provider="litellm", status_code=400,
+                    msg,
+                    provider="litellm",
+                    status_code=400,
                 ) from e
             except litellm.BadRequestError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelInvalidRequestError(
-                    str(e), provider="litellm", status_code=400,
+                    msg,
+                    provider="litellm",
+                    status_code=400,
                 ) from e
             except litellm.ServiceUnavailableError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
                 raise KernelProviderUnavailableError(
-                    str(e), provider="litellm", status_code=503, retryable=True,
+                    msg,
+                    provider="litellm",
+                    status_code=503,
+                    retryable=True,
                 ) from e
             except litellm.Timeout as e:
                 raise KernelLLMTimeoutError(
                     f"Request timed out after {timeout}s",
-                    provider="litellm", retryable=True,
+                    provider="litellm",
+                    retryable=True,
                 ) from e
             except KernelLLMError:
                 raise  # Already translated
             except Exception as e:
+                body = getattr(e, "body", None)
+                error_msg = (
+                    json.dumps(body, default=str)
+                    if body is not None
+                    else (str(e) or f"{type(e).__name__}: (no message)")
+                )
                 raise KernelLLMError(
-                    str(e) or f"{type(e).__name__}: (no message)",
-                    provider="litellm", retryable=True,
+                    error_msg,
+                    provider="litellm",
+                    retryable=True,
                 ) from e
 
         async def _on_retry(attempt: int, delay: float, error: KernelLLMError):
@@ -321,6 +390,7 @@ class LiteLLMProvider:
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
+
 def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
     """Convert ChatRequest messages to litellm format (OpenAI-compatible)."""
     messages = []
@@ -329,11 +399,13 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
         content = msg.content
 
         if role == "tool":
-            messages.append({
-                "role": "tool",
-                "tool_call_id": msg.tool_call_id or "",
-                "content": content if isinstance(content, str) else str(content),
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id or "",
+                    "content": content if isinstance(content, str) else str(content),
+                }
+            )
             continue
 
         entry: dict[str, Any] = {"role": role}
@@ -370,14 +442,18 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
                     tc_id = tc.id or ""
                     tc_name = getattr(tc, "name", None) or getattr(tc, "tool", "") or ""
                     tc_args = tc.arguments if tc.arguments is not None else {}
-                normalized_tcs.append({
-                    "id": tc_id,
-                    "type": "function",
-                    "function": {
-                        "name": tc_name,
-                        "arguments": json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args or "{}"),
-                    },
-                })
+                normalized_tcs.append(
+                    {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc_name,
+                            "arguments": json.dumps(tc_args)
+                            if isinstance(tc_args, dict)
+                            else str(tc_args or "{}"),
+                        },
+                    }
+                )
             entry["tool_calls"] = normalized_tcs
 
         messages.append(entry)
@@ -392,14 +468,16 @@ def _to_litellm_tools(request: ChatRequest) -> list[dict[str, Any]] | None:
 
     tools = []
     for t in request.tools:
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": t.name or "",
-                "description": t.description or "",
-                "parameters": t.parameters or t.input_schema or {"type": "object"},
-            },
-        })
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name or "",
+                    "description": t.description or "",
+                    "parameters": t.parameters or t.input_schema or {"type": "object"},
+                },
+            }
+        )
     return tools
 
 
@@ -420,11 +498,13 @@ def _from_litellm_response(response: Any) -> ChatResponse:
                 except (json.JSONDecodeError, TypeError):
                     args = {"raw": args}
 
-            tool_calls.append(ToolCall(
-                id=tc.id,
-                name=tc.function.name,
-                arguments=args,
-            ))
+            tool_calls.append(
+                ToolCall(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=args,
+                )
+            )
 
     # Build Usage object
     usage = None
@@ -439,7 +519,10 @@ def _from_litellm_response(response: Any) -> ChatResponse:
         }
 
         # Extract cache info when available
-        if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+        if (
+            hasattr(response.usage, "prompt_tokens_details")
+            and response.usage.prompt_tokens_details
+        ):
             details = response.usage.prompt_tokens_details
             if hasattr(details, "cached_tokens") and details.cached_tokens:
                 usage_kwargs["cache_read_tokens"] = details.cached_tokens
