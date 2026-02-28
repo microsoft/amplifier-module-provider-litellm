@@ -777,3 +777,141 @@ class TestRetryAfterExtraction:
                 await provider.complete(request)
 
             assert exc_info.value.retry_after is None
+
+
+# ---------------------------------------------------------------------------
+# Overloaded (529) delay multiplier
+# ---------------------------------------------------------------------------
+
+
+class TestOverloadedDelayMultiplier:
+    """Verify delay_multiplier is applied for overloaded (529) errors routed through ServiceUnavailableError."""
+
+    @pytest.mark.asyncio
+    async def test_status_529_gets_overloaded_delay_multiplier(self):
+        """Status 529 -> delay_multiplier == 10.0 and status_code == 529."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=529, headers={})
+        body = {"message": "overloaded"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeErrorWithResponse,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr(
+                    "overloaded", body=body, status_code=529, response=resp
+                )
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.delay_multiplier == 10.0
+            assert exc_info.value.status_code == 529
+
+    @pytest.mark.asyncio
+    async def test_overloaded_in_message_with_status_503(self):
+        """'overloaded' in message with status 503 -> delay_multiplier == 10.0."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=503, headers={})
+        body = {"message": "API is overloaded"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeErrorWithResponse,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr(
+                    "API is overloaded", body=body, status_code=503, response=resp
+                )
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.delay_multiplier == 10.0
+
+    @pytest.mark.asyncio
+    async def test_genuine_503_no_overloaded_multiplier(self):
+        """Genuine 503 (not overloaded) -> delay_multiplier == 1.0."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=503, headers={})
+        body = {"message": "service unavailable"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeErrorWithResponse,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr(
+                    "service unavailable",
+                    body=body,
+                    status_code=503,
+                    response=resp,
+                )
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.delay_multiplier == 1.0
+
+    @pytest.mark.asyncio
+    async def test_custom_overloaded_delay_multiplier_config(self):
+        """Custom overloaded_delay_multiplier config of 5.0 -> delay_multiplier == 5.0."""
+        provider = LiteLLMProvider(
+            {
+                "model": "openai/gpt-4o",
+                "overloaded_delay_multiplier": 5.0,
+                "max_retries": 0,
+            }
+        )
+        request = MagicMock()
+        request.model = "openai/gpt-4o"
+        request.messages = []
+        request.tools = None
+        request.max_output_tokens = 100
+        request.temperature = 0.0
+
+        resp = _FakeResponse(status_code=529, headers={})
+        body = {"message": "overloaded"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeErrorWithResponse,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr(
+                    "overloaded", body=body, status_code=529, response=resp
+                )
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.delay_multiplier == 5.0
