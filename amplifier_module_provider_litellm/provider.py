@@ -26,6 +26,8 @@ from amplifier_core.llm_errors import (
     InvalidRequestError as KernelInvalidRequestError,
     LLMError as KernelLLMError,
     LLMTimeoutError as KernelLLMTimeoutError,
+    NetworkError as KernelNetworkError,
+    NotFoundError as KernelNotFoundError,
     ProviderUnavailableError as KernelProviderUnavailableError,
     RateLimitError as KernelRateLimitError,
 )
@@ -326,6 +328,22 @@ class LiteLLMProvider:
                     retryable=True,
                     retry_after=_extract_retry_after(e),
                     delay_multiplier=multiplier,
+                ) from e
+            except litellm.NotFoundError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
+                raise KernelNotFoundError(
+                    msg,
+                    provider="litellm",
+                    status_code=404,
+                ) from e
+            except litellm.APIConnectionError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
+                raise KernelNetworkError(
+                    msg,
+                    provider="litellm",
+                    retryable=True,
                 ) from e
             except litellm.Timeout as e:
                 raise KernelLLMTimeoutError(

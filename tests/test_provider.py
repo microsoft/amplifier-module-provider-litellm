@@ -359,6 +359,8 @@ def _patch_litellm_error_classes(mock_litellm):
     mock_litellm.ContentPolicyViolationError = _Never
     mock_litellm.BadRequestError = _Never
     mock_litellm.ServiceUnavailableError = _Never
+    mock_litellm.NotFoundError = _Never
+    mock_litellm.APIConnectionError = _Never
     mock_litellm.Timeout = _Never
     return mock_litellm
 
@@ -915,3 +917,126 @@ class TestOverloadedDelayMultiplier:
                 await provider.complete(request)
 
             assert exc_info.value.delay_multiplier == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Missing error mappings: NotFoundError and APIConnectionError
+# ---------------------------------------------------------------------------
+
+
+class TestMissingErrorMappings:
+    """Verify NotFoundError -> KernelNotFoundError and APIConnectionError -> KernelNetworkError."""
+
+    @pytest.mark.asyncio
+    async def test_not_found_error_maps_to_kernel_not_found(self):
+        """litellm.NotFoundError -> KernelNotFoundError with retryable=False, status_code=404."""
+        provider, request = _make_no_retry_provider_and_request()
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            NotFoundErr = type("NotFoundError", (_FakeError,), {})
+            mock_litellm.NotFoundError = NotFoundErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=NotFoundErr("model not found", body=None)
+            )
+
+            from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
+
+            with pytest.raises(KernelNotFoundError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retryable is False
+            assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_not_found_error_retryable_must_be_false(self):
+        """NotFoundError must NOT fall through to the generic Exception handler (which sets retryable=True)."""
+        provider, request = _make_no_retry_provider_and_request()
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            NotFoundErr = type("NotFoundError", (_FakeError,), {})
+            mock_litellm.NotFoundError = NotFoundErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=NotFoundErr("model not found", body=None)
+            )
+
+            from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
+
+            with pytest.raises(KernelNotFoundError) as exc_info:
+                await provider.complete(request)
+
+            # Must be False, not True (generic handler sets retryable=True)
+            assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_api_connection_error_maps_to_kernel_network_error(self):
+        """litellm.APIConnectionError -> KernelNetworkError with retryable=True."""
+        provider, request = _make_no_retry_provider_and_request()
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            ConnErr = type("APIConnectionError", (_FakeError,), {})
+            mock_litellm.APIConnectionError = ConnErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=ConnErr("connection refused", body=None)
+            )
+
+            from amplifier_core.llm_errors import NetworkError as KernelNetworkError
+
+            with pytest.raises(KernelNetworkError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_api_connection_error_with_body_uses_json_dumps(self):
+        """APIConnectionError with .body uses json.dumps(body) in message."""
+        provider, request = _make_no_retry_provider_and_request()
+        body = {"message": "connection reset", "code": "ECONNRESET"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            ConnErr = type("APIConnectionError", (_FakeError,), {})
+            mock_litellm.APIConnectionError = ConnErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=ConnErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import NetworkError as KernelNetworkError
+
+            with pytest.raises(KernelNetworkError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_not_found_error_with_body_uses_json_dumps(self):
+        """NotFoundError with .body uses json.dumps(body) in message."""
+        provider, request = _make_no_retry_provider_and_request()
+        body = {"message": "model not found", "type": "not_found"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            NotFoundErr = type("NotFoundError", (_FakeError,), {})
+            mock_litellm.NotFoundError = NotFoundErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=NotFoundErr("str repr", body=body)
+            )
+
+            from amplifier_core.llm_errors import NotFoundError as KernelNotFoundError
+
+            with pytest.raises(KernelNotFoundError) as exc_info:
+                await provider.complete(request)
+
+            assert json.dumps(body) in str(exc_info.value)
