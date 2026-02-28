@@ -202,7 +202,6 @@ class LiteLLMProvider:
                             context_window=ctx,
                             max_output_tokens=max_out,
                             capabilities=["tools", "streaming"],
-                            metadata={"cost_tier": "medium"},
                         )
                     )
 
@@ -216,7 +215,6 @@ class LiteLLMProvider:
                     context_window=200_000,
                     max_output_tokens=64_000,
                     capabilities=["tools", "streaming"],
-                    metadata={"cost_tier": "medium"},
                 ),
             )
 
