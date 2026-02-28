@@ -46,6 +46,26 @@ litellm.suppress_debug_info = True
 _DEFAULT_TIMEOUT = 300.0
 
 
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Extract retry-after seconds from a litellm exception's httpx response headers.
+
+    Returns the parsed float value, or None if unavailable or unparseable.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return None
+
+
 class LiteLLMProvider:
     """Amplifier provider that delegates LLM calls to litellm.
 
@@ -261,6 +281,7 @@ class LiteLLMProvider:
                     provider="litellm",
                     status_code=429,
                     retryable=True,
+                    retry_after=_extract_retry_after(e),
                 ) from e
             except litellm.ContextWindowExceededError as e:
                 body = getattr(e, "body", None)
@@ -289,11 +310,13 @@ class LiteLLMProvider:
             except litellm.ServiceUnavailableError as e:
                 body = getattr(e, "body", None)
                 msg = json.dumps(body, default=str) if body is not None else str(e)
+                status = getattr(e, "status_code", 503) or 503
                 raise KernelProviderUnavailableError(
                     msg,
                     provider="litellm",
-                    status_code=503,
+                    status_code=status,
                     retryable=True,
+                    retry_after=_extract_retry_after(e),
                 ) from e
             except litellm.Timeout as e:
                 raise KernelLLMTimeoutError(

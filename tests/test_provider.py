@@ -570,3 +570,185 @@ class TestErrorMessageUsesJsonBody:
                 await provider.complete(request)
 
             assert "plain error" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Fake helpers for retry-after extraction tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Mimics an httpx.Response with status_code and headers."""
+
+    def __init__(self, status_code=200, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+class _FakeErrorWithResponse(Exception):
+    """Exception with .response.headers, mimicking litellm exceptions backed by httpx."""
+
+    def __init__(self, message, body=None, status_code=None, response=None):
+        super().__init__(message)
+        self.body = body
+        self.status_code = status_code
+        self.response = response
+
+
+# ---------------------------------------------------------------------------
+# Retry-After extraction from response headers
+# ---------------------------------------------------------------------------
+
+
+def _make_no_retry_provider_and_request():
+    """Helper: build a LiteLLMProvider with retries disabled and a minimal ChatRequest mock."""
+    provider = LiteLLMProvider({"model": "openai/gpt-4o", "max_retries": 0})
+    request = MagicMock()
+    request.model = "openai/gpt-4o"
+    request.messages = []
+    request.tools = None
+    request.max_output_tokens = 100
+    request.temperature = 0.0
+    return provider, request
+
+
+class TestRetryAfterExtraction:
+    """Verify retry_after is extracted from litellm exception response headers."""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_with_retry_after_header(self):
+        """RateLimitError with Retry-After header -> retry_after == 30.0."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=429, headers={"retry-after": "30"})
+        body = {"message": "rate limited"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            RateErr = type("RateLimitError", (_FakeErrorWithResponse,), {})
+            mock_litellm.RateLimitError = RateErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=RateErr(
+                    "rate limited", body=body, status_code=429, response=resp
+                )
+            )
+
+            from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+
+            with pytest.raises(KernelRateLimitError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retry_after == 30.0
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_without_retry_after_header(self):
+        """RateLimitError without header -> retry_after is None."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=429, headers={})
+        body = {"message": "rate limited"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            RateErr = type("RateLimitError", (_FakeErrorWithResponse,), {})
+            mock_litellm.RateLimitError = RateErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=RateErr(
+                    "rate limited", body=body, status_code=429, response=resp
+                )
+            )
+
+            from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+
+            with pytest.raises(KernelRateLimitError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retry_after is None
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_no_response_attribute(self):
+        """RateLimitError with no .response attribute -> retry_after is None (no crash)."""
+        provider, request = _make_no_retry_provider_and_request()
+        body = {"message": "rate limited"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            # Use _FakeError which has no .response attribute
+            RateErr = type("RateLimitError", (_FakeError,), {})
+            mock_litellm.RateLimitError = RateErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=RateErr("rate limited", body=body)
+            )
+
+            from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+
+            with pytest.raises(KernelRateLimitError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retry_after is None
+
+    @pytest.mark.asyncio
+    async def test_service_unavailable_with_retry_after_header(self):
+        """ServiceUnavailableError with Retry-After header -> retry_after == 60.0."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=503, headers={"retry-after": "60"})
+        body = {"message": "service unavailable"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeErrorWithResponse,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr(
+                    "service unavailable",
+                    body=body,
+                    status_code=503,
+                    response=resp,
+                )
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retry_after == 60.0
+
+    @pytest.mark.asyncio
+    async def test_service_unavailable_without_retry_after_header(self):
+        """ServiceUnavailableError without header -> retry_after is None."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=503, headers={})
+        body = {"message": "service unavailable"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            SvcErr = type("ServiceUnavailableError", (_FakeErrorWithResponse,), {})
+            mock_litellm.ServiceUnavailableError = SvcErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=SvcErr(
+                    "service unavailable",
+                    body=body,
+                    status_code=503,
+                    response=resp,
+                )
+            )
+
+            from amplifier_core.llm_errors import (
+                ProviderUnavailableError as KernelProviderUnavailableError,
+            )
+
+            with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retry_after is None
