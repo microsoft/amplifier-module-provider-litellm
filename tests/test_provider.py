@@ -585,12 +585,11 @@ class _FakeResponse:
         self.headers = headers or {}
 
 
-class _FakeErrorWithResponse(Exception):
+class _FakeErrorWithResponse(_FakeError):
     """Exception with .response.headers, mimicking litellm exceptions backed by httpx."""
 
     def __init__(self, message, body=None, status_code=None, response=None):
-        super().__init__(message)
-        self.body = body
+        super().__init__(message, body=body)
         self.status_code = status_code
         self.response = response
 
@@ -749,6 +748,32 @@ class TestRetryAfterExtraction:
             )
 
             with pytest.raises(KernelProviderUnavailableError) as exc_info:
+                await provider.complete(request)
+
+            assert exc_info.value.retry_after is None
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_with_non_numeric_retry_after_header(self):
+        """RateLimitError with non-numeric Retry-After header -> retry_after is None."""
+        provider, request = _make_no_retry_provider_and_request()
+        resp = _FakeResponse(status_code=429, headers={"retry-after": "not-a-number"})
+        body = {"message": "rate limited"}
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            _patch_litellm_error_classes(mock_litellm)
+            RateErr = type("RateLimitError", (_FakeErrorWithResponse,), {})
+            mock_litellm.RateLimitError = RateErr
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=RateErr(
+                    "rate limited", body=body, status_code=429, response=resp
+                )
+            )
+
+            from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
+
+            with pytest.raises(KernelRateLimitError) as exc_info:
                 await provider.complete(request)
 
             assert exc_info.value.retry_after is None
