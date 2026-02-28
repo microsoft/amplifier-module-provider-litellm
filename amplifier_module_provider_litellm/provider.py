@@ -26,6 +26,8 @@ from amplifier_core.llm_errors import (
     InvalidRequestError as KernelInvalidRequestError,
     LLMError as KernelLLMError,
     LLMTimeoutError as KernelLLMTimeoutError,
+    NetworkError as KernelNetworkError,
+    NotFoundError as KernelNotFoundError,
     ProviderUnavailableError as KernelProviderUnavailableError,
     RateLimitError as KernelRateLimitError,
 )
@@ -44,6 +46,26 @@ logger = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
 _DEFAULT_TIMEOUT = 300.0
+
+
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Extract retry-after seconds from a litellm exception's httpx response headers.
+
+    Returns the parsed float value, or None if unavailable or unparseable.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return None
 
 
 class LiteLLMProvider:
@@ -67,6 +89,9 @@ class LiteLLMProvider:
         self._timeout: float = float(self.config.get("timeout", _DEFAULT_TIMEOUT))
         self._drop_params: bool = self.config.get("drop_params", True)
         self.debug: bool = self.config.get("debug", False)
+        self._overloaded_delay_multiplier: float = float(
+            self.config.get("overloaded_delay_multiplier", 10.0)
+        )
 
         # Retry configuration — delegates to shared retry_with_backoff from amplifier-core
         jitter_val = self.config.get("retry_jitter", 0.2)
@@ -261,6 +286,7 @@ class LiteLLMProvider:
                     provider="litellm",
                     status_code=429,
                     retryable=True,
+                    retry_after=_extract_retry_after(e),
                 ) from e
             except litellm.ContextWindowExceededError as e:
                 body = getattr(e, "body", None)
@@ -287,12 +313,36 @@ class LiteLLMProvider:
                     status_code=400,
                 ) from e
             except litellm.ServiceUnavailableError as e:
+                # Anthropic 529 "Overloaded" routes through litellm as
+                # ServiceUnavailableError. Detect overloaded condition to
+                # apply a longer backoff via delay_multiplier.
                 body = getattr(e, "body", None)
                 msg = json.dumps(body, default=str) if body is not None else str(e)
+                status = getattr(e, "status_code", 503) or 503
+                is_overloaded = status == 529 or "overloaded" in str(e).lower()
+                multiplier = self._overloaded_delay_multiplier if is_overloaded else 1.0
                 raise KernelProviderUnavailableError(
                     msg,
                     provider="litellm",
-                    status_code=503,
+                    status_code=status,
+                    retryable=True,
+                    retry_after=_extract_retry_after(e),
+                    delay_multiplier=multiplier,
+                ) from e
+            except litellm.NotFoundError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
+                raise KernelNotFoundError(
+                    msg,
+                    provider="litellm",
+                    status_code=404,
+                ) from e
+            except litellm.APIConnectionError as e:
+                body = getattr(e, "body", None)
+                msg = json.dumps(body, default=str) if body is not None else str(e)
+                raise KernelNetworkError(
+                    msg,
+                    provider="litellm",
                     retryable=True,
                 ) from e
             except litellm.Timeout as e:
