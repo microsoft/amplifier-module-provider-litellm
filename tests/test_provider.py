@@ -49,11 +49,11 @@ class TestProviderInit:
         assert p._retry_config.initial_delay == 2.0
 
     def test_retry_config_jitter_is_bool(self):
-        """RetryConfig jitter must be set from a bool, not a float."""
-        # Default jitter=True should produce jitter > 0
+        """Provider passes bool jitter; RetryConfig stores it as float internally."""
+        # Default jitter=True → RetryConfig stores as positive float
         p = LiteLLMProvider()
         assert p._retry_config.jitter > 0.0
-        # Explicit jitter=False should produce jitter == 0.0
+        # Explicit jitter=False → RetryConfig stores as 0.0
         p2 = LiteLLMProvider({"retry_jitter": False})
         assert p2._retry_config.jitter == 0.0
 
