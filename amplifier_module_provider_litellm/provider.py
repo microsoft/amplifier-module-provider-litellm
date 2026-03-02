@@ -94,14 +94,11 @@ class LiteLLMProvider:
         )
 
         # Retry configuration — delegates to shared retry_with_backoff from amplifier-core
-        jitter_val = self.config.get("retry_jitter", 0.2)
-        if isinstance(jitter_val, bool):
-            jitter_val = 0.2 if jitter_val else 0.0
         self._retry_config = RetryConfig(
             max_retries=int(self.config.get("max_retries", 3)),
-            min_delay=float(self.config.get("min_retry_delay", 1.0)),
+            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=float(jitter_val),
+            jitter=bool(self.config.get("retry_jitter", True)),
         )
 
     def get_info(self) -> ProviderInfo:

@@ -43,6 +43,33 @@ class TestProviderInit:
         p = LiteLLMProvider(coordinator=coord)
         assert p.coordinator is coord
 
+    def test_retry_config_uses_initial_delay(self):
+        """RetryConfig must use initial_delay (not min_delay)."""
+        p = LiteLLMProvider({"min_retry_delay": 2.0})
+        assert p._retry_config.initial_delay == 2.0
+
+    def test_retry_config_jitter_is_bool(self):
+        """RetryConfig jitter must be set from a bool, not a float."""
+        # Default jitter=True should produce jitter > 0
+        p = LiteLLMProvider()
+        assert p._retry_config.jitter > 0.0
+        # Explicit jitter=False should produce jitter == 0.0
+        p2 = LiteLLMProvider({"retry_jitter": False})
+        assert p2._retry_config.jitter == 0.0
+
+    def test_retry_config_max_retries_default_is_3(self):
+        """LiteLLM provider must default to max_retries=3."""
+        p = LiteLLMProvider()
+        assert p._retry_config.max_retries == 3
+
+    def test_retry_config_no_jitter_compat_code(self):
+        """No bool/float jitter compat code should remain in __init__."""
+        import inspect
+
+        source = inspect.getsource(LiteLLMProvider.__init__)
+        assert "jitter_val" not in source
+        assert "isinstance(jitter_val" not in source
+
 
 class TestProviderInfo:
     def test_get_info(self):
