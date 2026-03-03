@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-amplifier-core = { path = "../amplifier-core" }
+amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }
 
 [project.optional-dependencies]
 dev = [
