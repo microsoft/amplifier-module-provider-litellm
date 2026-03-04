@@ -20,6 +20,7 @@ from typing import Any
 import litellm
 from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
 from amplifier_core.llm_errors import (
+    AccessDeniedError as KernelAccessDeniedError,
     AuthenticationError as KernelAuthenticationError,
     ContentFilterError as KernelContentFilterError,
     ContextLengthError as KernelContextLengthError,
@@ -274,6 +275,27 @@ class LiteLLMProvider:
                     msg,
                     provider="litellm",
                     status_code=401,
+                ) from e
+            except litellm.PermissionDeniedError as e:
+                body = getattr(e, "body", None)
+                status = getattr(e, "status_code", 403) or 403
+                msg = json.dumps(body, default=str) if body is not None else str(e)
+                # CDN/proxy 403: body is None (no JSON parsed from HTML challenge)
+                if status == 403 and body is None:
+                    logger.warning(
+                        "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                        "with no body). Treating as transient — will retry."
+                    )
+                    raise KernelProviderUnavailableError(
+                        msg,
+                        provider="litellm",
+                        status_code=status,
+                        retryable=True,
+                    ) from e
+                raise KernelAccessDeniedError(
+                    msg,
+                    provider="litellm",
+                    status_code=status,
                 ) from e
             except litellm.RateLimitError as e:
                 body = getattr(e, "body", None)
