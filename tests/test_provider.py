@@ -381,6 +381,7 @@ def _patch_litellm_error_classes(mock_litellm):
         pass
 
     mock_litellm.AuthenticationError = _Never
+    mock_litellm.PermissionDeniedError = _Never
     mock_litellm.RateLimitError = _Never
     mock_litellm.ContextWindowExceededError = _Never
     mock_litellm.ContentPolicyViolationError = _Never
