@@ -35,6 +35,7 @@ from amplifier_core.llm_errors import (
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
+    Message,
     TextBlock,
     ToolCall,
     Usage,
@@ -119,6 +120,12 @@ class LiteLLMProvider:
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
             jitter=bool(self.config.get("retry_jitter", True)),
         )
+
+        # Track tool call IDs that have been repaired with synthetic results.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations (since synthetic results
+        # are injected into request.messages but not persisted to message store).
+        self._repaired_tool_ids: set[str] = set()
 
     def get_info(self) -> ProviderInfo:
         """Return provider metadata."""
@@ -252,8 +259,156 @@ class LiteLLMProvider:
 
         return models
 
+    # ------------------------------------------------------------------
+    # Tool sequence repair
+    # ------------------------------------------------------------------
+
+    def _find_missing_tool_results(
+        self,
+        messages: list[Message],
+    ) -> list[tuple[int, str, str]]:
+        """Find tool calls without matching tool result messages.
+
+        Scans conversation for assistant tool calls and validates each has
+        a corresponding tool result message. Returns missing pairs WITH their
+        source message index so they can be inserted in the correct position.
+
+        Handles tool calls that appear as:
+        - ``msg.tool_calls`` (OpenAI-style, via getattr for safety)
+        - Content blocks with ``type == "tool_call"`` (orchestrator format)
+
+        Excludes tool call IDs that have already been repaired with synthetic
+        results to prevent infinite detection loops.
+
+        Returns:
+            List of ``(msg_index, call_id, tool_name)`` tuples for unpaired calls.
+            ``msg_index`` is the index of the assistant message containing the call.
+        """
+        tool_calls: dict[str, tuple[int, str]] = {}  # {call_id: (msg_index, name)}
+        tool_results: set[str] = set()  # {call_id}
+
+        for idx, msg in enumerate(messages):
+            if msg.role == "assistant":
+                # Path 1: tool_calls attribute (OpenAI-style, may be absent on
+                # deserialized Message objects)
+                tcs = getattr(msg, "tool_calls", None)
+                if tcs:
+                    for tc in tcs:
+                        if isinstance(tc, dict):
+                            tc_id = tc.get("id", "")
+                            tc_name = tc.get("name") or tc.get("tool", "")
+                        else:
+                            tc_id = getattr(tc, "id", "") or ""
+                            tc_name = (
+                                getattr(tc, "name", None)
+                                or getattr(tc, "tool", "")
+                                or ""
+                            )
+                        if tc_id:
+                            tool_calls[tc_id] = (idx, tc_name)
+
+                # Path 2: content blocks with type == "tool_call"
+                # (orchestrator may store tool calls inside content list)
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if (
+                            hasattr(block, "type")
+                            and getattr(block, "type", None) == "tool_call"
+                        ):
+                            blk_id = getattr(block, "id", "") or ""
+                            blk_name = getattr(block, "name", "") or ""
+                            if blk_id:
+                                tool_calls[blk_id] = (idx, blk_name)
+                        elif (
+                            isinstance(block, dict) and block.get("type") == "tool_call"
+                        ):
+                            blk_id = block.get("id", "")
+                            blk_name = block.get("name", "")
+                            if blk_id:
+                                tool_calls[blk_id] = (idx, blk_name)
+
+            elif msg.role == "tool":
+                tc_id = getattr(msg, "tool_call_id", None) or ""
+                if tc_id:
+                    tool_results.add(tc_id)
+
+        # Exclude IDs that have already been repaired to prevent infinite loops
+        return [
+            (msg_idx, call_id, name)
+            for call_id, (msg_idx, name) in tool_calls.items()
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+        ]
+
+    def _create_synthetic_result(self, tool_call_id: str) -> Message:
+        """Create a synthetic error result for a missing tool response.
+
+        This is a BACKUP safety net for when tool results go missing AFTER
+        execution — typically due to context compaction or message store bugs.
+        """
+        return Message(
+            role="tool",
+            content=(
+                "[SYSTEM ERROR: Tool result lost during context management. "
+                "The tool was called but its result is no longer available. "
+                "This is an infrastructure issue, not a user error.]"
+            ),
+            tool_call_id=tool_call_id,
+        )
+
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
         """Send a completion request through litellm with retry and error translation."""
+
+        # ------------------------------------------------------------------
+        # VALIDATE AND REPAIR: check for missing tool results (safety net)
+        # ------------------------------------------------------------------
+        missing = self._find_missing_tool_results(request.messages)
+
+        if missing:
+            logger.warning(
+                "[PROVIDER] litellm: Detected %d missing tool result(s). "
+                "Injecting synthetic errors. This indicates a bug in context management. "
+                "Tool IDs: %s",
+                len(missing),
+                [call_id for _, call_id, _ in missing],
+            )
+
+            # Group missing results by source assistant message index.
+            # We insert synthetic results IMMEDIATELY after each assistant
+            # message that contains tool calls (not at the end of the list).
+            from collections import defaultdict
+
+            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
+            for msg_idx, call_id, tool_name in missing:
+                by_msg_idx[msg_idx].append((call_id, tool_name))
+
+            # Insert in reverse order of message index so earlier insertions
+            # don't shift later indices.
+            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
+                synthetics: list[Message] = []
+                for call_id, tool_name in by_msg_idx[msg_idx]:
+                    synthetics.append(self._create_synthetic_result(call_id))
+                    # Track this ID so we don't detect it again in future iterations
+                    self._repaired_tool_ids.add(call_id)
+
+                # Insert all synthetic results immediately after the assistant message
+                insert_pos = msg_idx + 1
+                for i, synthetic in enumerate(synthetics):
+                    request.messages.insert(insert_pos + i, synthetic)
+
+            # Emit observability event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:tool_sequence_repaired",
+                    {
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for _, call_id, tool_name in missing
+                        ],
+                    },
+                )
+
         model = request.model or kwargs.get("model", self.default_model)
         timeout = kwargs.get("timeout", self._timeout)
 
@@ -298,9 +453,7 @@ class LiteLLMProvider:
                 try:
                     # Include litellm kwargs (redacted) for debugging
                     debug_kwargs = {
-                        k: v
-                        for k, v in litellm_kwargs.items()
-                        if k not in ("api_key",)
+                        k: v for k, v in litellm_kwargs.items() if k not in ("api_key",)
                     }
                     raw_str = json.dumps(debug_kwargs, default=str)
                     if len(raw_str) > 16384:
@@ -482,10 +635,7 @@ class LiteLLMProvider:
                         and response.usage.prompt_tokens_details
                     ):
                         details = response.usage.prompt_tokens_details
-                        if (
-                            hasattr(details, "cached_tokens")
-                            and details.cached_tokens
-                        ):
+                        if hasattr(details, "cached_tokens") and details.cached_tokens:
                             usage_event["cache_read"] = details.cached_tokens
                     if (
                         hasattr(response.usage, "cache_creation_input_tokens")
@@ -497,7 +647,11 @@ class LiteLLMProvider:
                     response_event["usage"] = usage_event
                 if self._raw_debug:
                     try:
-                        raw = response.model_dump() if hasattr(response, "model_dump") else str(response)
+                        raw = (
+                            response.model_dump()
+                            if hasattr(response, "model_dump")
+                            else str(response)
+                        )
                         raw_str = json.dumps(raw, default=str)
                         # Truncate to prevent event bloat (16KB max)
                         if len(raw_str) > 16384:
@@ -704,12 +858,8 @@ def _from_litellm_response(response: Any) -> ChatResponse:
             )
 
         # Extract reasoning/thinking tokens when available (e.g. OpenAI o-series)
-        completion_details = getattr(
-            response.usage, "completion_tokens_details", None
-        )
-        if completion_details and getattr(
-            completion_details, "reasoning_tokens", None
-        ):
+        completion_details = getattr(response.usage, "completion_tokens_details", None)
+        if completion_details and getattr(completion_details, "reasoning_tokens", None):
             usage_kwargs["reasoning_tokens"] = completion_details.reasoning_tokens
 
         usage = Usage(**usage_kwargs)
