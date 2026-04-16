@@ -94,7 +94,11 @@ class LiteLLMProvider:
     ) -> None:
         self.config = config or {}
         self.coordinator = coordinator
-        self.default_model: str = self.config.get("model", "anthropic/claude-opus-4-6")
+        self.default_model: str = (
+            self.config.get("default_model")
+            or self.config.get("model")
+            or "anthropic/claude-opus-4-6"
+        )
         self._timeout: float = float(self.config.get("timeout", _DEFAULT_TIMEOUT))
         self._drop_params: bool = self.config.get("drop_params", True)
         self.debug: bool = self.config.get("debug", False)
