@@ -18,4 +18,7 @@ __version__ = "0.1.0"
 # Amplifier module loader to discover them.
 from amplifier_module_provider_litellm.module import mount, __amplifier_module_type__
 
-__all__ = ["mount", "__amplifier_module_type__", "__version__"]
+# Export the provider class so Amplifier's static module validator finds it.
+from amplifier_module_provider_litellm.provider import LiteLLMProvider
+
+__all__ = ["mount", "__amplifier_module_type__", "__version__", "LiteLLMProvider"]
