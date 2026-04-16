@@ -36,6 +36,7 @@ from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     Usage,
 )
@@ -282,6 +283,11 @@ class LiteLLMProvider:
         if request.temperature is not None:
             litellm_kwargs["temperature"] = request.temperature
 
+        # Pass through reasoning_effort for thinking/reasoning models
+        reasoning_effort = getattr(request, "reasoning_effort", None)
+        if reasoning_effort:
+            litellm_kwargs["reasoning_effort"] = reasoning_effort
+
         # Pass through response_format for structured output (e.g. JSON mode)
         if hasattr(request, "response_format") and request.response_format:
             litellm_kwargs["response_format"] = request.response_format
@@ -298,9 +304,7 @@ class LiteLLMProvider:
                 try:
                     # Include litellm kwargs (redacted) for debugging
                     debug_kwargs = {
-                        k: v
-                        for k, v in litellm_kwargs.items()
-                        if k not in ("api_key",)
+                        k: v for k, v in litellm_kwargs.items() if k not in ("api_key",)
                     }
                     raw_str = json.dumps(debug_kwargs, default=str)
                     if len(raw_str) > 16384:
@@ -482,10 +486,7 @@ class LiteLLMProvider:
                         and response.usage.prompt_tokens_details
                     ):
                         details = response.usage.prompt_tokens_details
-                        if (
-                            hasattr(details, "cached_tokens")
-                            and details.cached_tokens
-                        ):
+                        if hasattr(details, "cached_tokens") and details.cached_tokens:
                             usage_event["cache_read"] = details.cached_tokens
                     if (
                         hasattr(response.usage, "cache_creation_input_tokens")
@@ -497,7 +498,11 @@ class LiteLLMProvider:
                     response_event["usage"] = usage_event
                 if self._raw_debug:
                     try:
-                        raw = response.model_dump() if hasattr(response, "model_dump") else str(response)
+                        raw = (
+                            response.model_dump()
+                            if hasattr(response, "model_dump")
+                            else str(response)
+                        )
                         raw_str = json.dumps(raw, default=str)
                         # Truncate to prevent event bloat (16KB max)
                         if len(raw_str) > 16384:
@@ -704,20 +709,25 @@ def _from_litellm_response(response: Any) -> ChatResponse:
             )
 
         # Extract reasoning/thinking tokens when available (e.g. OpenAI o-series)
-        completion_details = getattr(
-            response.usage, "completion_tokens_details", None
-        )
-        if completion_details and getattr(
-            completion_details, "reasoning_tokens", None
-        ):
+        completion_details = getattr(response.usage, "completion_tokens_details", None)
+        if completion_details and getattr(completion_details, "reasoning_tokens", None):
             usage_kwargs["reasoning_tokens"] = completion_details.reasoning_tokens
 
         usage = Usage(**usage_kwargs)
 
     # Build content blocks
-    content: list[TextBlock] = []
+    content: list[TextBlock | ThinkingBlock] = []
     if text:
         content = [TextBlock(text=text)]
+
+    # Extract thinking/reasoning content when available.
+    # litellm normalizes this across providers (Anthropic thinking,
+    # OpenAI reasoning, Gemini thinking) into `reasoning_content`.
+    # Phase 1: output-only -- we extract but do NOT round-trip thinking
+    # blocks back as input (the OpenAI-compatible API doesn't accept them).
+    reasoning_text = getattr(message, "reasoning_content", None)
+    if reasoning_text and isinstance(reasoning_text, str) and reasoning_text.strip():
+        content.insert(0, ThinkingBlock(thinking=reasoning_text, visibility="internal"))
 
     return ChatResponse(
         content=content,
