@@ -77,7 +77,7 @@ class TestProviderInfo:
         info = p.get_info()
         assert info.id == "litellm"
         assert "tools" in info.capabilities
-        assert "streaming" in info.capabilities
+        assert "streaming" not in info.capabilities  # streaming not implemented yet
         assert info.credential_env_vars == []
         assert len(info.config_fields) >= 1
 

@@ -96,6 +96,7 @@ class LiteLLMProvider:
         self._timeout: float = float(self.config.get("timeout", _DEFAULT_TIMEOUT))
         self._drop_params: bool = self.config.get("drop_params", True)
         self.debug: bool = self.config.get("debug", False)
+        self._raw_debug: bool = self.config.get("raw_debug", False)
         self._overloaded_delay_multiplier: float = float(
             self.config.get("overloaded_delay_multiplier", 10.0)
         )
@@ -125,7 +126,7 @@ class LiteLLMProvider:
             id="litellm",
             display_name="LiteLLM (Multi-Provider)",
             credential_env_vars=[],  # litellm reads env vars per-provider automatically
-            capabilities=["tools", "streaming"],
+            capabilities=["tools"],
             defaults={
                 "model": self.default_model,
                 "max_tokens": 8192,
@@ -232,7 +233,7 @@ class LiteLLMProvider:
                             display_name=display,
                             context_window=ctx,
                             max_output_tokens=max_out,
-                            capabilities=["tools", "streaming"],
+                            capabilities=["tools"],
                         )
                     )
 
@@ -245,7 +246,7 @@ class LiteLLMProvider:
                     display_name=self.default_model,
                     context_window=200_000,
                     max_output_tokens=64_000,
-                    capabilities=["tools", "streaming"],
+                    capabilities=["tools"],
                 ),
             )
 
@@ -281,17 +282,33 @@ class LiteLLMProvider:
         if request.temperature is not None:
             litellm_kwargs["temperature"] = request.temperature
 
+        # Pass through response_format for structured output (e.g. JSON mode)
+        if hasattr(request, "response_format") and request.response_format:
+            litellm_kwargs["response_format"] = request.response_format
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": "litellm",
-                    "model": model,
-                    "message_count": len(messages),
-                    "tool_count": len(tools or []),
-                },
-            )
+            request_event: dict[str, Any] = {
+                "provider": "litellm",
+                "model": model,
+                "message_count": len(messages),
+                "tool_count": len(tools or []),
+            }
+            if self._raw_debug:
+                try:
+                    # Include litellm kwargs (redacted) for debugging
+                    debug_kwargs = {
+                        k: v
+                        for k, v in litellm_kwargs.items()
+                        if k not in ("api_key",)
+                    }
+                    raw_str = json.dumps(debug_kwargs, default=str)
+                    if len(raw_str) > 16384:
+                        raw_str = raw_str[:16384] + "...[truncated]"
+                    request_event["raw_request"] = raw_str
+                except Exception:
+                    pass  # Don't let debug mode break the provider
+            await self.coordinator.hooks.emit("llm:request", request_event)
 
         logger.info(
             "litellm complete: model=%s, messages=%d, tools=%d",
@@ -455,10 +472,39 @@ class LiteLLMProvider:
                     "duration_ms": elapsed_ms,
                 }
                 if response.usage:
-                    response_event["usage"] = {
+                    usage_event: dict[str, Any] = {
                         "input": response.usage.prompt_tokens or 0,
                         "output": response.usage.completion_tokens or 0,
                     }
+                    # Include cache metrics when available
+                    if (
+                        hasattr(response.usage, "prompt_tokens_details")
+                        and response.usage.prompt_tokens_details
+                    ):
+                        details = response.usage.prompt_tokens_details
+                        if (
+                            hasattr(details, "cached_tokens")
+                            and details.cached_tokens
+                        ):
+                            usage_event["cache_read"] = details.cached_tokens
+                    if (
+                        hasattr(response.usage, "cache_creation_input_tokens")
+                        and response.usage.cache_creation_input_tokens
+                    ):
+                        usage_event["cache_write"] = (
+                            response.usage.cache_creation_input_tokens
+                        )
+                    response_event["usage"] = usage_event
+                if self._raw_debug:
+                    try:
+                        raw = response.model_dump() if hasattr(response, "model_dump") else str(response)
+                        raw_str = json.dumps(raw, default=str)
+                        # Truncate to prevent event bloat (16KB max)
+                        if len(raw_str) > 16384:
+                            raw_str = raw_str[:16384] + "...[truncated]"
+                        response_event["raw_response"] = raw_str
+                    except Exception:
+                        pass  # Don't let debug mode break the provider
                 await self.coordinator.hooks.emit("llm:response", response_event)
 
             return _from_litellm_response(response)
@@ -511,6 +557,18 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
                     "role": "tool",
                     "tool_call_id": getattr(msg, "tool_call_id", "") or "",
                     "content": content if isinstance(content, str) else str(content),
+                }
+            )
+            continue
+
+        # Developer/system context messages -> user messages with XML wrapping
+        # (same pattern as anthropic and vllm providers)
+        if role == "developer":
+            content_str = content if isinstance(content, str) else str(content)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"<context_file>\n{content_str}\n</context_file>",
                 }
             )
             continue
@@ -635,6 +693,24 @@ def _from_litellm_response(response: Any) -> ChatResponse:
             details = response.usage.prompt_tokens_details
             if hasattr(details, "cached_tokens") and details.cached_tokens:
                 usage_kwargs["cache_read_tokens"] = details.cached_tokens
+
+        # Extract cache write (creation) tokens when available (e.g. Anthropic)
+        if (
+            hasattr(response.usage, "cache_creation_input_tokens")
+            and response.usage.cache_creation_input_tokens
+        ):
+            usage_kwargs["cache_write_tokens"] = (
+                response.usage.cache_creation_input_tokens
+            )
+
+        # Extract reasoning/thinking tokens when available (e.g. OpenAI o-series)
+        completion_details = getattr(
+            response.usage, "completion_tokens_details", None
+        )
+        if completion_details and getattr(
+            completion_details, "reasoning_tokens", None
+        ):
+            usage_kwargs["reasoning_tokens"] = completion_details.reasoning_tokens
 
         usage = Usage(**usage_kwargs)
 
