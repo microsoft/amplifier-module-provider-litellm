@@ -1068,3 +1068,163 @@ class TestMissingErrorMappings:
                 await provider.complete(request)
 
             assert json.dumps(body) in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Thinking/reasoning extraction (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_litellm_response(
+    content="Hello",
+    reasoning_content=None,
+    tool_calls_list=None,
+    prompt_tokens=10,
+    completion_tokens=5,
+):
+    """Helper: build a mock litellm response with optional reasoning_content."""
+    response = MagicMock()
+    choice = MagicMock()
+    choice.message.content = content
+    choice.message.tool_calls = tool_calls_list
+    choice.finish_reason = "stop"
+    # Set reasoning_content as an attribute (litellm normalizes this)
+    if reasoning_content is not None:
+        choice.message.reasoning_content = reasoning_content
+    else:
+        # Simulate missing attribute (default for most responses)
+        del choice.message.reasoning_content
+    response.choices = [choice]
+    response.usage.prompt_tokens = prompt_tokens
+    response.usage.completion_tokens = completion_tokens
+    response.usage.total_tokens = prompt_tokens + completion_tokens
+    response.usage.prompt_tokens_details = None
+    response.model = "openai/o3"
+    return response
+
+
+class TestThinkingExtraction:
+    """Verify thinking/reasoning content is extracted from litellm responses."""
+
+    def test_response_with_reasoning_content(self):
+        """reasoning_content -> ThinkingBlock first, TextBlock second."""
+        from amplifier_core.message_models import ThinkingBlock
+
+        response = _make_mock_litellm_response(
+            content="The answer is 42.",
+            reasoning_content="Let me think step by step...",
+        )
+        result = _from_litellm_response(response)
+
+        assert len(result.content) == 2
+        assert isinstance(result.content[0], ThinkingBlock)
+        assert result.content[0].thinking == "Let me think step by step..."
+        assert result.content[0].visibility == "internal"
+        assert result.content[1].text == "The answer is 42."
+
+    def test_response_without_reasoning_content(self):
+        """No reasoning_content -> backward compatible, only TextBlock."""
+        from amplifier_core.message_models import ThinkingBlock
+
+        response = _make_mock_litellm_response(content="Hello world")
+        result = _from_litellm_response(response)
+
+        assert len(result.content) == 1
+        assert not isinstance(result.content[0], ThinkingBlock)
+        assert result.content[0].text == "Hello world"
+
+    def test_response_with_empty_reasoning_content(self):
+        """Empty string reasoning_content -> no ThinkingBlock."""
+        from amplifier_core.message_models import ThinkingBlock
+
+        response = _make_mock_litellm_response(content="Hello", reasoning_content="")
+        result = _from_litellm_response(response)
+
+        assert len(result.content) == 1
+        assert not isinstance(result.content[0], ThinkingBlock)
+
+    def test_response_with_whitespace_only_reasoning_content(self):
+        """Whitespace-only reasoning_content -> no ThinkingBlock."""
+        from amplifier_core.message_models import ThinkingBlock
+
+        response = _make_mock_litellm_response(
+            content="Hello", reasoning_content="   \n  "
+        )
+        result = _from_litellm_response(response)
+
+        assert len(result.content) == 1
+        assert not isinstance(result.content[0], ThinkingBlock)
+
+    def test_reasoning_content_with_tool_calls(self):
+        """reasoning_content + tool_calls -> ThinkingBlock + tool calls both preserved."""
+        from amplifier_core.message_models import ThinkingBlock
+
+        tc = MagicMock()
+        tc.id = "call_abc"
+        tc.function.name = "web_search"
+        tc.function.arguments = '{"query": "test"}'
+
+        response = _make_mock_litellm_response(
+            content="",
+            reasoning_content="I need to search for this.",
+            tool_calls_list=[tc],
+        )
+        result = _from_litellm_response(response)
+
+        # ThinkingBlock should be present
+        thinking_blocks = [b for b in result.content if isinstance(b, ThinkingBlock)]
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0].thinking == "I need to search for this."
+
+        # Tool calls should also be present
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "web_search"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_effort_passed_to_litellm(self):
+        """reasoning_effort on request -> passed through to litellm kwargs."""
+        provider = LiteLLMProvider({"model": "openai/o3"})
+
+        mock_response = _make_mock_litellm_response()
+        request = MagicMock()
+        request.model = "openai/o3"
+        request.messages = []
+        request.tools = None
+        request.max_output_tokens = 100
+        request.temperature = 0.0
+        request.reasoning_effort = "high"
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+            _patch_litellm_error_classes(mock_litellm)
+            await provider.complete(request)
+
+            call_kwargs = mock_litellm.acompletion.call_args[1]
+            assert call_kwargs["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_effort_not_passed_when_absent(self):
+        """No reasoning_effort on request -> not in litellm kwargs."""
+        provider = LiteLLMProvider({"model": "openai/gpt-4o"})
+
+        mock_response = _make_mock_litellm_response()
+        request = MagicMock()
+        request.model = "openai/gpt-4o"
+        request.messages = []
+        request.tools = None
+        request.max_output_tokens = 100
+        request.temperature = 0.5
+        # Ensure reasoning_effort attribute is missing
+        del request.reasoning_effort
+
+        with patch(
+            "amplifier_module_provider_litellm.provider.litellm"
+        ) as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+            _patch_litellm_error_classes(mock_litellm)
+            await provider.complete(request)
+
+            call_kwargs = mock_litellm.acompletion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
