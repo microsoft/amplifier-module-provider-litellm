@@ -74,6 +74,12 @@ class LiteLLMProvider:
 
     litellm handles provider detection, API key resolution, and request
     formatting automatically based on the model name prefix.
+
+    For local/self-hosted endpoints (llama-server, vLLM, TGI, LocalAI, etc.),
+    set ``api_base`` in the config to point at your server and use the
+    ``openai/`` model prefix.  An ``api_key`` can also be provided (defaults
+    to the relevant environment variable, or ``"not-needed"`` when
+    ``api_base`` is set and no key is configured).
     """
 
     name = "litellm"
@@ -92,6 +98,17 @@ class LiteLLMProvider:
         self.debug: bool = self.config.get("debug", False)
         self._overloaded_delay_multiplier: float = float(
             self.config.get("overloaded_delay_multiplier", 10.0)
+        )
+
+        # Optional explicit base URL and API key for local/self-hosted endpoints.
+        # When api_base is set, litellm routes to that URL instead of the
+        # provider's default.  api_key defaults to "not-needed" for local
+        # servers that don't require authentication.
+        self._api_base: str | None = self.config.get(
+            "api_base", os.environ.get("LITELLM_API_BASE")
+        )
+        self._api_key: str | None = self.config.get("api_key") or (
+            "not-needed" if self._api_base else None
         )
 
         # Retry configuration — delegates to shared retry_with_backoff from amplifier-core
@@ -123,6 +140,22 @@ class LiteLLMProvider:
                     prompt="Default model (e.g. anthropic/claude-opus-4-6, openai/gpt-4o, gemini/gemini-2.5-flash)",
                     required=False,
                     default="anthropic/claude-opus-4-6",
+                ),
+                ConfigField(
+                    id="api_base",
+                    display_name="API Base URL",
+                    field_type="text",
+                    prompt="Base URL for self-hosted endpoints (e.g. http://localhost:8080). Leave empty for cloud providers.",
+                    required=False,
+                    default="",
+                ),
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="API key (defaults to provider env var, or 'not-needed' for local servers)",
+                    required=False,
+                    default="",
                 ),
             ],
         )
@@ -233,6 +266,11 @@ class LiteLLMProvider:
             "timeout": timeout,
             "drop_params": self._drop_params,
         }
+
+        if self._api_base:
+            litellm_kwargs["api_base"] = self._api_base
+        if self._api_key:
+            litellm_kwargs["api_key"] = self._api_key
 
         if tools:
             litellm_kwargs["tools"] = tools
@@ -471,7 +509,7 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": msg.tool_call_id or "",
+                    "tool_call_id": getattr(msg, "tool_call_id", "") or "",
                     "content": content if isinstance(content, str) else str(content),
                 }
             )
@@ -500,7 +538,9 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
 
         # Preserve tool_calls on assistant messages
         # Tool calls may be ToolCall objects OR plain dicts (from context storage)
-        if role == "assistant" and msg.tool_calls:
+        # Use getattr because Message objects from context replay may lack
+        # the tool_calls attribute entirely (not just None).
+        if role == "assistant" and getattr(msg, "tool_calls", None):
             normalized_tcs = []
             for tc in msg.tool_calls:
                 if isinstance(tc, dict):
