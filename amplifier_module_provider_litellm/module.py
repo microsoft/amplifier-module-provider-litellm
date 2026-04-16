@@ -26,6 +26,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             timeout: request timeout seconds (default: 300)
             drop_params: let litellm drop unsupported params (default: true)
             max_retries: retry count for transient errors (default: 3)
+            api_base: base URL for self-hosted endpoints (e.g. "http://localhost:8080")
+            api_key: API key override (defaults to env var or "not-needed" for local servers)
     """
     from amplifier_module_provider_litellm.provider import LiteLLMProvider
 

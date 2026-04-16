@@ -32,6 +32,28 @@ config:
         timeout: 300                                # optional
 ```
 
+### Self-Hosted / Local Endpoints
+
+For llama-server, vLLM, TGI, LocalAI, LM Studio, or any OpenAI-compatible
+server, use `api_base` to point directly at it:
+
+```yaml
+config:
+  providers:
+    - module: provider-litellm
+      source: amplifier-module-provider-litellm
+      config:
+        default_model: openai/my-local-model
+        api_base: http://localhost:8080
+        # api_key defaults to "not-needed" when api_base is set
+```
+
+Use the `openai/` model prefix. The model name after the prefix is passed
+to the server as-is. No environment variables are required for local
+endpoints -- `api_base` and `api_key` are fully configurable from settings.
+
+`api_base` can also be set via the `LITELLM_API_BASE` environment variable.
+
 ### Set Environment Variables
 
 litellm reads standard provider env vars:
