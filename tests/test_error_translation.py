@@ -18,13 +18,14 @@ def _make_no_retry_provider_and_request():
     """Build a LiteLLMProvider with retries disabled and a minimal ChatRequest mock."""
     from amplifier_module_provider_litellm.provider import LiteLLMProvider
 
-    provider = LiteLLMProvider({"model": "openai/gpt-4o", "max_retries": 0})
+    provider = LiteLLMProvider({"model": "openai/gpt-4o", "max_retries": 0, "use_streaming": False})
     request = MagicMock()
     request.model = "openai/gpt-4o"
     request.messages = []
     request.tools = None
     request.max_output_tokens = 100
     request.temperature = 0.0
+    request.metadata = {"stream": False}  # force non-streaming path
     return provider, request
 
 

@@ -77,7 +77,7 @@ class TestProviderInfo:
         info = p.get_info()
         assert info.id == "litellm"
         assert "tools" in info.capabilities
-        assert "streaming" not in info.capabilities  # streaming not implemented yet
+        assert "streaming" in info.capabilities  # streaming implemented
         assert info.credential_env_vars == []
         assert len(info.config_fields) >= 1
 
@@ -288,6 +288,7 @@ class TestComplete:
         request.tools = None
         request.max_output_tokens = 100
         request.temperature = 0.0
+        request.metadata = {"stream": False}  # force non-streaming path
 
         with patch(
             "amplifier_module_provider_litellm.provider.litellm"
@@ -367,6 +368,7 @@ def _make_provider_and_request():
     request.tools = None
     request.max_output_tokens = 100
     request.temperature = 0.0
+    request.metadata = {"stream": False}  # force non-streaming path in these tests
     return provider, request
 
 
@@ -638,6 +640,7 @@ def _make_no_retry_provider_and_request():
     request.tools = None
     request.max_output_tokens = 100
     request.temperature = 0.0
+    request.metadata = {"stream": False}  # force non-streaming path in these tests
     return provider, request
 
 
@@ -921,6 +924,7 @@ class TestOverloadedDelayMultiplier:
         request.tools = None
         request.max_output_tokens = 100
         request.temperature = 0.0
+        request.metadata = {"stream": False}  # force non-streaming path
 
         resp = _FakeResponse(status_code=529, headers={})
         body = {"message": "overloaded"}
@@ -1192,6 +1196,7 @@ class TestThinkingExtraction:
         request.tools = None
         request.max_output_tokens = 100
         request.temperature = 0.0
+        request.metadata = {"stream": False}  # force non-streaming path
         request.reasoning_effort = "high"
 
         with patch(
@@ -1216,6 +1221,7 @@ class TestThinkingExtraction:
         request.tools = None
         request.max_output_tokens = 100
         request.temperature = 0.5
+        request.metadata = {"stream": False}  # force non-streaming path
         # Ensure reasoning_effort attribute is missing
         del request.reasoning_effort
 

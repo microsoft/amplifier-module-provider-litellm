@@ -33,4 +33,19 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     provider = LiteLLMProvider(config, coordinator=coordinator)
     await coordinator.mount("providers", provider, name="litellm")
+    # Declare the events this provider contributes so the ecosystem can
+    # discover them (e.g. for UI wiring, documentation, or validation).
+    coordinator.register_contributor(
+        "events",
+        "provider-litellm",
+        lambda: [
+            "llm:request",
+            "llm:response",
+            "llm:stream_block_start",
+            "llm:stream_block_delta",
+            "llm:stream_thinking_delta",
+            "llm:stream_block_end",
+            "llm:stream_aborted",
+        ],
+    )
     logger.info("Mounted LiteLLMProvider (default_model=%s)", provider.default_model)

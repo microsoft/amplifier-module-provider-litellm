@@ -40,3 +40,30 @@ class TestMount:
         provider = coordinator.mount.call_args[0][1]
         assert provider.default_model == "gemini/gemini-2.5-pro"
         assert provider._timeout == 120.0
+
+    @pytest.mark.asyncio
+    async def test_register_contributor_called(self):
+        """register_contributor is called to declare emitted events on the events channel."""
+        coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
+
+        await mount(coordinator)
+
+        coordinator.register_contributor.assert_called_once()
+        call_args = coordinator.register_contributor.call_args
+        channel = call_args[0][0]
+        contributor_name = call_args[0][1]
+        callback = call_args[0][2]
+
+        assert channel == "events"
+        assert "litellm" in contributor_name
+
+        # Callback must return the declared event list
+        declared = callback()
+        assert "llm:request" in declared
+        assert "llm:response" in declared
+        assert "llm:stream_block_start" in declared
+        assert "llm:stream_block_delta" in declared
+        assert "llm:stream_thinking_delta" in declared
+        assert "llm:stream_block_end" in declared
+        assert "llm:stream_aborted" in declared
