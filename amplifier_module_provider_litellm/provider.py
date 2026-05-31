@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Any
 
 import litellm
@@ -126,6 +127,9 @@ class LiteLLMProvider:
             jitter=bool(self.config.get("retry_jitter", True)),
         )
 
+        # Streaming flag: emit token-level streaming events when True
+        self.use_streaming: bool = bool(self.config.get("use_streaming", True))
+
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
         # detected repeatedly across LLM iterations (since synthetic results
@@ -138,7 +142,7 @@ class LiteLLMProvider:
             id="litellm",
             display_name="LiteLLM (Multi-Provider)",
             credential_env_vars=[],  # litellm reads env vars per-provider automatically
-            capabilities=["tools"],
+            capabilities=["tools", "streaming"],
             defaults={
                 "model": self.default_model,
                 "max_tokens": 8192,
@@ -451,6 +455,12 @@ class LiteLLMProvider:
         if hasattr(request, "response_format") and request.response_format:
             litellm_kwargs["response_format"] = request.response_format
 
+        # Per-request streaming override (identity check, not truthiness)
+        _meta = getattr(request, "metadata", None)
+        _use_streaming = self.use_streaming
+        if isinstance(_meta, dict) and _meta.get("stream") is False:
+            _use_streaming = False
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             request_event: dict[str, Any] = {
@@ -617,6 +627,431 @@ class LiteLLMProvider:
                     },
                 )
 
+        # ----------------------------------------------------------------
+        # STREAMING PATH
+        # ----------------------------------------------------------------
+        if _use_streaming:
+            streaming_kwargs = {
+                **litellm_kwargs,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+
+            try:
+                # Step 1: Open the stream with error translation.
+                # The retry_with_backoff wrapper is BYPASSED for streaming because
+                # mid-stream retries are incompatible with chunk-based iteration.
+                # Connection-time errors are translated here; mid-stream errors
+                # are handled by the inner try/except below.
+                try:
+                    stream = await litellm.acompletion(**streaming_kwargs)
+                except litellm.AuthenticationError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelAuthenticationError(
+                        msg, provider="litellm", status_code=401
+                    ) from e
+                except litellm.PermissionDeniedError as e:
+                    body = getattr(e, "body", None)
+                    status = getattr(e, "status_code", 403) or 403
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    if status == 403 and body is None:
+                        logger.warning(
+                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                            "with no body). Treating as transient — will retry."
+                        )
+                        raise KernelProviderUnavailableError(
+                            msg, provider="litellm", status_code=status, retryable=True
+                        ) from e
+                    raise KernelAccessDeniedError(
+                        msg, provider="litellm", status_code=status
+                    ) from e
+                except litellm.RateLimitError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelRateLimitError(
+                        msg,
+                        provider="litellm",
+                        status_code=429,
+                        retryable=True,
+                        retry_after=_extract_retry_after(e),
+                    ) from e
+                except litellm.ContextWindowExceededError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelContextLengthError(
+                        msg, provider="litellm", status_code=400
+                    ) from e
+                except litellm.ContentPolicyViolationError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelContentFilterError(
+                        msg, provider="litellm", status_code=400
+                    ) from e
+                except litellm.BadRequestError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelInvalidRequestError(
+                        msg, provider="litellm", status_code=400
+                    ) from e
+                except litellm.ServiceUnavailableError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    status = getattr(e, "status_code", 503) or 503
+                    is_overloaded = status == 529 or "overloaded" in str(e).lower()
+                    multiplier = self._overloaded_delay_multiplier if is_overloaded else 1.0
+                    raise KernelProviderUnavailableError(
+                        msg,
+                        provider="litellm",
+                        status_code=status,
+                        retryable=True,
+                        retry_after=_extract_retry_after(e),
+                        delay_multiplier=multiplier,
+                    ) from e
+                except litellm.NotFoundError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelNotFoundError(
+                        msg, provider="litellm", status_code=404
+                    ) from e
+                except litellm.APIConnectionError as e:
+                    body = getattr(e, "body", None)
+                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    raise KernelNetworkError(
+                        msg, provider="litellm", retryable=True
+                    ) from e
+                except litellm.Timeout as e:
+                    raise KernelLLMTimeoutError(
+                        f"Request timed out after {timeout}s",
+                        provider="litellm",
+                        retryable=True,
+                    ) from e
+                except KernelLLMError:
+                    raise  # Already translated
+                except Exception as e:
+                    body = getattr(e, "body", None)
+                    error_msg = (
+                        json.dumps(body, default=str)
+                        if body is not None
+                        else (str(e) or f"{type(e).__name__}: (no message)")
+                    )
+                    raise KernelLLMError(
+                        error_msg, provider="litellm", retryable=True
+                    ) from e
+
+                # Step 2: Iterate the stream, synthesising block boundaries and emitting events.
+                request_id = str(uuid.uuid4())
+                seq: dict[int, int] = {}           # block_index -> next sequence number
+                block_types: dict[int, str] = {}   # block_index -> type (for block_end)
+                block_index = 0
+                partial_emitted = False
+
+                # Currently-open block indices (None = no open block of that type)
+                current_thinking_bidx: int | None = None
+                current_text_bidx: int | None = None
+
+                # Tool call accumulation
+                tool_call_state: dict[int, dict[str, Any]] = {}
+
+                # Accumulated final-response data
+                full_text = ""
+                full_thinking = ""
+                assembled_tool_calls: list[ToolCall] = []
+                final_usage = None
+                finish_reason: str | None = None
+
+                hooks_available = bool(
+                    self.coordinator and hasattr(self.coordinator, "hooks")
+                )
+
+                try:
+                    async for chunk in stream:
+                        # Usage-only chunks have empty choices
+                        if not chunk.choices:
+                            if hasattr(chunk, "usage") and chunk.usage:
+                                final_usage = chunk.usage
+                            continue
+
+                        choice = chunk.choices[0]
+                        delta = choice.delta
+                        if choice.finish_reason:
+                            finish_reason = choice.finish_reason
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            final_usage = chunk.usage
+
+                        # ---- thinking / reasoning content ----
+                        thinking_text = getattr(delta, "reasoning_content", None)
+                        if thinking_text:
+                            if current_thinking_bidx is None:
+                                current_thinking_bidx = block_index
+                                seq[block_index] = 0
+                                block_types[block_index] = "thinking"
+                                block_index += 1
+                                if hooks_available:
+                                    await self.coordinator.hooks.emit(
+                                        "llm:stream_block_start",
+                                        {
+                                            "request_id": request_id,
+                                            "block_index": current_thinking_bidx,
+                                            "block_type": "thinking",
+                                        },
+                                    )
+                            if hooks_available:
+                                await self.coordinator.hooks.emit(
+                                    "llm:stream_block_delta",
+                                    {
+                                        "request_id": request_id,
+                                        "block_index": current_thinking_bidx,
+                                        "block_type": "thinking",
+                                        "sequence": seq[current_thinking_bidx],
+                                        "text": thinking_text,
+                                    },
+                                )
+                                seq[current_thinking_bidx] += 1
+                            partial_emitted = True
+                            full_thinking += thinking_text
+
+                        # ---- text content ----
+                        text_content = delta.content
+                        if text_content:
+                            # Synthesise thinking block_end on transition to text
+                            if current_thinking_bidx is not None:
+                                if hooks_available:
+                                    await self.coordinator.hooks.emit(
+                                        "llm:stream_block_end",
+                                        {
+                                            "request_id": request_id,
+                                            "block_index": current_thinking_bidx,
+                                            "block_type": "thinking",
+                                        },
+                                    )
+                                current_thinking_bidx = None
+
+                            if current_text_bidx is None:
+                                current_text_bidx = block_index
+                                seq[block_index] = 0
+                                block_types[block_index] = "text"
+                                block_index += 1
+                                if hooks_available:
+                                    await self.coordinator.hooks.emit(
+                                        "llm:stream_block_start",
+                                        {
+                                            "request_id": request_id,
+                                            "block_index": current_text_bidx,
+                                            "block_type": "text",
+                                        },
+                                    )
+                            if hooks_available:
+                                await self.coordinator.hooks.emit(
+                                    "llm:stream_block_delta",
+                                    {
+                                        "request_id": request_id,
+                                        "block_index": current_text_bidx,
+                                        "block_type": "text",
+                                        "sequence": seq[current_text_bidx],
+                                        "text": text_content,
+                                    },
+                                )
+                                seq[current_text_bidx] += 1
+                            partial_emitted = True
+                            full_text += text_content
+
+                        # ---- tool calls ----
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                tc_idx = tc.index
+                                if tc_idx not in tool_call_state:
+                                    tc_name = (
+                                        (tc.function.name or "")
+                                        if tc.function
+                                        else ""
+                                    )
+                                    tc_id = tc.id or ""
+                                    tc_bidx = block_index
+                                    tool_call_state[tc_idx] = {
+                                        "name": tc_name,
+                                        "id": tc_id,
+                                        "args_parts": [],
+                                        "block_index": tc_bidx,
+                                    }
+                                    block_types[tc_bidx] = "tool_use"
+                                    seq[tc_bidx] = 0
+                                    block_index += 1
+                                    if hooks_available:
+                                        tc_payload: dict[str, Any] = {
+                                            "request_id": request_id,
+                                            "block_index": tc_bidx,
+                                            "block_type": "tool_use",
+                                        }
+                                        if tc_name:
+                                            tc_payload["name"] = tc_name
+                                        await self.coordinator.hooks.emit(
+                                            "llm:stream_block_start", tc_payload
+                                        )
+                                if tc.function and tc.function.arguments:
+                                    tool_call_state[tc_idx]["args_parts"].append(
+                                        tc.function.arguments
+                                    )
+
+                    # ---- stream ended normally: close open blocks ----
+                    if current_thinking_bidx is not None and hooks_available:
+                        await self.coordinator.hooks.emit(
+                            "llm:stream_block_end",
+                            {
+                                "request_id": request_id,
+                                "block_index": current_thinking_bidx,
+                                "block_type": "thinking",
+                            },
+                        )
+                        current_thinking_bidx = None
+
+                    if current_text_bidx is not None and hooks_available:
+                        await self.coordinator.hooks.emit(
+                            "llm:stream_block_end",
+                            {
+                                "request_id": request_id,
+                                "block_index": current_text_bidx,
+                                "block_type": "text",
+                            },
+                        )
+                        current_text_bidx = None
+
+                    # Close tool_use blocks and assemble final tool calls
+                    for tc_idx in sorted(tool_call_state.keys()):
+                        tc_state = tool_call_state[tc_idx]
+                        if hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_end",
+                                {
+                                    "request_id": request_id,
+                                    "block_index": tc_state["block_index"],
+                                    "block_type": "tool_use",
+                                },
+                            )
+                        args_str = "".join(tc_state["args_parts"])
+                        try:
+                            args = json.loads(args_str) if args_str else {}
+                        except (json.JSONDecodeError, TypeError):
+                            args = {"raw": args_str}
+                        assembled_tool_calls.append(
+                            ToolCall(
+                                id=tc_state["id"],
+                                name=tc_state["name"],
+                                arguments=args,
+                            )
+                        )
+
+                except Exception as e:
+                    # Mid-stream abort: emit stream_aborted only after partial emit
+                    if partial_emitted and hooks_available:
+                        await self.coordinator.hooks.emit(
+                            "llm:stream_aborted",
+                            {
+                                "request_id": request_id,
+                                "error": {
+                                    "type": type(e).__name__,
+                                    "msg": str(e),
+                                },
+                            },
+                        )
+                    raise
+
+                # ---- Build final ChatResponse ----
+                elapsed_ms = int((time.time() - start_time) * 1000)
+
+                stream_content: list[TextBlock | ThinkingBlock] = []
+                # Apply the same whitespace guard as _from_litellm_response (~line 888)
+                if full_thinking and isinstance(full_thinking, str) and full_thinking.strip():
+                    stream_content.append(
+                        ThinkingBlock(thinking=full_thinking, visibility="internal")
+                    )
+                if full_text:
+                    stream_content.append(TextBlock(text=full_text))
+
+                stream_usage: Usage | None = None
+                if final_usage:
+                    in_toks = getattr(final_usage, "prompt_tokens", 0) or 0
+                    out_toks = getattr(final_usage, "completion_tokens", 0) or 0
+                    su_kwargs: dict[str, Any] = {
+                        "input_tokens": in_toks,
+                        "output_tokens": out_toks,
+                        "total_tokens": in_toks + out_toks,
+                    }
+                    if (
+                        hasattr(final_usage, "prompt_tokens_details")
+                        and final_usage.prompt_tokens_details
+                    ):
+                        ptd = final_usage.prompt_tokens_details
+                        if hasattr(ptd, "cached_tokens") and ptd.cached_tokens:
+                            su_kwargs["cache_read_tokens"] = ptd.cached_tokens
+                    if (
+                        hasattr(final_usage, "cache_creation_input_tokens")
+                        and final_usage.cache_creation_input_tokens
+                    ):
+                        su_kwargs["cache_write_tokens"] = (
+                            final_usage.cache_creation_input_tokens
+                        )
+                    cds = getattr(final_usage, "completion_tokens_details", None)
+                    if cds and getattr(cds, "reasoning_tokens", None):
+                        su_kwargs["reasoning_tokens"] = cds.reasoning_tokens
+                    stream_usage = Usage(**su_kwargs)
+
+                # Emit llm:response
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    resp_event: dict[str, Any] = {
+                        "provider": "litellm",
+                        "model": model,
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    }
+                    if stream_usage:
+                        su_ev: dict[str, Any] = {
+                            "input": stream_usage.input_tokens,
+                            "output": stream_usage.output_tokens,
+                        }
+                        if (
+                            hasattr(stream_usage, "cache_read_tokens")
+                            and stream_usage.cache_read_tokens
+                        ):
+                            su_ev["cache_read"] = stream_usage.cache_read_tokens
+                        if (
+                            hasattr(stream_usage, "cache_write_tokens")
+                            and stream_usage.cache_write_tokens
+                        ):
+                            su_ev["cache_write"] = stream_usage.cache_write_tokens
+                        resp_event["usage"] = su_ev
+                    await self.coordinator.hooks.emit("llm:response", resp_event)
+
+                return ChatResponse(
+                    content=stream_content,
+                    tool_calls=assembled_tool_calls if assembled_tool_calls else None,
+                    usage=stream_usage,
+                    finish_reason=finish_reason,
+                    metadata={"model": model} if model else None,
+                )
+
+            except KernelLLMError as e:
+                # Connection-time errors land here; emit llm:response error
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                logger.error("[PROVIDER] litellm streaming error: %s", str(e))
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "llm:response",
+                        {
+                            "provider": "litellm",
+                            "model": model,
+                            "status": "error",
+                            "duration_ms": elapsed_ms,
+                            "error": str(e),
+                        },
+                    )
+                raise
+            # Non-KernelLLMError mid-stream exceptions (already had stream_aborted
+            # emitted above) propagate naturally without llm:response error.
+
+        # ----------------------------------------------------------------
+        # NON-STREAMING PATH (original blocking path, preserved unchanged)
+        # ----------------------------------------------------------------
         try:
             response = await retry_with_backoff(
                 _do_complete,

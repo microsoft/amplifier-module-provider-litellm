@@ -65,7 +65,8 @@ def _make_provider(
     coordinator: FakeCoordinator | None = None,
 ) -> LiteLLMProvider:
     """Create a provider with a fake coordinator wired up."""
-    p = LiteLLMProvider()
+    # use_streaming=False: these tests cover tool repair logic, not streaming
+    p = LiteLLMProvider({"use_streaming": False})
     if coordinator is not None:
         p.coordinator = cast(ModuleCoordinator, coordinator)
     return p
