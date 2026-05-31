@@ -64,6 +64,7 @@ class TestMount:
         assert "llm:response" in declared
         assert "llm:stream_block_start" in declared
         assert "llm:stream_block_delta" in declared
-        assert "llm:stream_thinking_delta" in declared
+        # Contract: llm:stream_thinking_delta is removed; block_type carries the distinction.
+        assert "llm:stream_thinking_delta" not in declared
         assert "llm:stream_block_end" in declared
         assert "llm:stream_aborted" in declared

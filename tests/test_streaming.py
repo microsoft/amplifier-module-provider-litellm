@@ -300,6 +300,7 @@ class TestTextStream:
         assert [d["text"] for d in deltas] == ["Hello", ", ", "world!"]
         assert [d["sequence"] for d in deltas] == [0, 1, 2]
         assert all(d["block_index"] == 0 for d in deltas)
+        assert all(d["block_type"] == "text" for d in deltas)
 
         ends = _events(coordinator, "llm:stream_block_end")
         assert len(ends) == 1
@@ -374,7 +375,7 @@ class TestThinkingStream:
 
     @pytest.mark.asyncio
     async def test_thinking_only_stream(self):
-        """reasoning_content chunks -> thinking block_start + stream_thinking_delta events."""
+        """reasoning_content chunks -> thinking block_start + block_delta(block_type=thinking) events."""
         chunks = [
             _thinking_chunk("Step 1..."),
             _thinking_chunk(" Step 2..."),
@@ -393,7 +394,13 @@ class TestThinkingStream:
         assert starts[0]["block_type"] == "thinking"
         assert starts[0]["block_index"] == 0
 
-        thinking_deltas = _events(coordinator, "llm:stream_thinking_delta")
+        # Contract: ONE block_delta event for all content; block_type carries the distinction.
+        # No llm:stream_thinking_delta — only llm:stream_block_delta with block_type=="thinking".
+        assert _events(coordinator, "llm:stream_thinking_delta") == []
+        thinking_deltas = [
+            d for d in _events(coordinator, "llm:stream_block_delta")
+            if d["block_type"] == "thinking"
+        ]
         assert len(thinking_deltas) == 2
         assert [d["sequence"] for d in thinking_deltas] == [0, 1]
         assert all(d["block_index"] == 0 for d in thinking_deltas)
@@ -471,8 +478,10 @@ class TestThinkingStream:
             m.acompletion = _fake_acompletion(*chunks)
             await provider.complete(request)
 
-        think_seqs = [d["sequence"] for d in _events(coordinator, "llm:stream_thinking_delta")]
-        text_seqs = [d["sequence"] for d in _events(coordinator, "llm:stream_block_delta")]
+        # Both thinking and text use llm:stream_block_delta; block_type distinguishes them.
+        all_deltas = _events(coordinator, "llm:stream_block_delta")
+        think_seqs = [d["sequence"] for d in all_deltas if d["block_type"] == "thinking"]
+        text_seqs = [d["sequence"] for d in all_deltas if d["block_type"] == "text"]
         assert think_seqs == [0, 1], "thinking sequence must restart at 0"
         assert text_seqs == [0, 1, 2], "text sequence must restart at 0"
 

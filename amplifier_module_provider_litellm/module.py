@@ -43,7 +43,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "llm:response",
             "llm:stream_block_start",
             "llm:stream_block_delta",
-            "llm:stream_thinking_delta",
             "llm:stream_block_end",
             "llm:stream_aborted",
         ],

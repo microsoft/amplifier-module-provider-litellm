@@ -798,10 +798,11 @@ class LiteLLMProvider:
                                     )
                             if hooks_available:
                                 await self.coordinator.hooks.emit(
-                                    "llm:stream_thinking_delta",
+                                    "llm:stream_block_delta",
                                     {
                                         "request_id": request_id,
                                         "block_index": current_thinking_bidx,
+                                        "block_type": "thinking",
                                         "sequence": seq[current_thinking_bidx],
                                         "text": thinking_text,
                                     },
@@ -846,6 +847,7 @@ class LiteLLMProvider:
                                     {
                                         "request_id": request_id,
                                         "block_index": current_text_bidx,
+                                        "block_type": "text",
                                         "sequence": seq[current_text_bidx],
                                         "text": text_content,
                                     },
