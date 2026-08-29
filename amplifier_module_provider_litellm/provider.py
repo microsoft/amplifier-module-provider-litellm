@@ -11,6 +11,7 @@ Model names follow litellm conventions:
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -50,6 +51,129 @@ logger = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
 _DEFAULT_TIMEOUT = 300.0
+
+# Config keys this provider actively reads. `priority` is read by the
+# orchestrator's provider-selection logic (attribute-then-config), and
+# `extra_request_params` is app-cli-reserved -- both stay allow-listed so
+# users are never told to delete live settings. `model` is a read-alias for
+# `default_model` (kept for backwards compatibility, not the canonical key).
+_KNOWN_CONFIG_KEYS = frozenset(
+    {
+        "default_model",
+        "model",
+        "timeout",
+        "drop_params",
+        "raw_debug",
+        "overloaded_delay_multiplier",
+        "api_base",
+        "api_key",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "use_streaming",
+        "instance_id",
+        "priority",
+        "extra_request_params",
+    }
+)
+
+# Targeted messages for keys that used to do something (or were documented
+# but never wired) and now have a known migration path.
+_INERT_CONFIG_KEY_MESSAGES = {
+    "debug": (
+        "Config key 'debug' is never wired to anything -- use 'raw_debug' "
+        "instead for raw request-payload capture on the 'llm:request' event."
+    ),
+}
+
+
+def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never fail) about config keys this provider doesn't recognize.
+
+    Ghost keys with a known migration path get a targeted message from
+    _INERT_CONFIG_KEY_MESSAGES; anything else gets a difflib did-you-mean
+    suggestion against the known key set.
+    """
+    for key in config:
+        if key in _KNOWN_CONFIG_KEYS:
+            continue
+        if key in _INERT_CONFIG_KEY_MESSAGES:
+            logger.warning("[PROVIDER] %s", _INERT_CONFIG_KEY_MESSAGES[key])
+            continue
+        suggestions = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        hint = f" Did you mean '{suggestions[0]}'?" if suggestions else ""
+        logger.warning("[PROVIDER] Unknown config key '%s' is ignored.%s", key, hint)
+
+
+def _coerce_bool(value: Any, *, key: str, default: bool) -> bool:
+    """Coerce a config value to bool, tolerating string forms from wizards.
+
+    Config wizards commonly persist booleans as the strings "true"/"false".
+    ``bool("false")`` evaluates to ``True`` in Python, silently inverting the
+    user's intent -- this parses the string content instead of relying on
+    Python truthiness.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+        logger.warning(
+            "[PROVIDER] Config key '%s' has unrecognized boolean value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+    logger.warning(
+        "[PROVIDER] Config key '%s' has unexpected type %s for a boolean "
+        "value (%r); coercing with bool().",
+        key,
+        type(value).__name__,
+        value,
+    )
+    return bool(value)
+
+
+def _coerce_float(value: Any, *, key: str, default: float) -> float:
+    """Coerce a config value to float, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid float value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+
+
+def _coerce_int(value: Any, *, key: str, default: int) -> int:
+    """Coerce a config value to int, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid integer value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
 
 
 def _extract_retry_after(exc: Exception) -> float | None:
@@ -95,17 +219,27 @@ class LiteLLMProvider:
     ) -> None:
         self.config = config or {}
         self.coordinator = coordinator
+        _warn_unknown_config_keys(self.config)
         self.default_model: str = (
             self.config.get("default_model")
             or self.config.get("model")
             or "anthropic/claude-opus-4-6"
         )
-        self._timeout: float = float(self.config.get("timeout", _DEFAULT_TIMEOUT))
-        self._drop_params: bool = self.config.get("drop_params", True)
-        self.debug: bool = self.config.get("debug", False)
-        self._raw_debug: bool = self.config.get("raw_debug", False)
-        self._overloaded_delay_multiplier: float = float(
-            self.config.get("overloaded_delay_multiplier", 10.0)
+        self._timeout: float = _coerce_float(
+            self.config.get("timeout"), key="timeout", default=_DEFAULT_TIMEOUT
+        )
+        self._drop_params: bool = _coerce_bool(
+            self.config.get("drop_params"), key="drop_params", default=True
+        )
+        # NOTE: 'debug' is intentionally not read here -- it was never wired
+        # to anything (see _INERT_CONFIG_KEY_MESSAGES). Use raw_debug.
+        self._raw_debug: bool = _coerce_bool(
+            self.config.get("raw_debug"), key="raw_debug", default=False
+        )
+        self._overloaded_delay_multiplier: float = _coerce_float(
+            self.config.get("overloaded_delay_multiplier"),
+            key="overloaded_delay_multiplier",
+            default=10.0,
         )
 
         # Optional explicit base URL and API key for local/self-hosted endpoints.
@@ -119,16 +253,43 @@ class LiteLLMProvider:
             "not-needed" if self._api_base else None
         )
 
-        # Retry configuration — delegates to shared retry_with_backoff from amplifier-core
+        # Retry configuration — delegates to shared retry_with_backoff from
+        # amplifier-core. This is a CLIENT-SIDE retry policy, separate from
+        # litellm's own internal `num_retries` (not used by this provider) --
+        # the two do not compose or share configuration.
         self._retry_config = RetryConfig(
-            max_retries=int(self.config.get("max_retries", 3)),
-            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
-            max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            max_retries=_coerce_int(
+                self.config.get("max_retries"), key="max_retries", default=3
+            ),
+            initial_delay=_coerce_float(
+                self.config.get("min_retry_delay"), key="min_retry_delay", default=1.0
+            ),
+            max_delay=_coerce_float(
+                self.config.get("max_retry_delay"), key="max_retry_delay", default=60.0
+            ),
+            jitter=_coerce_bool(
+                self.config.get("retry_jitter"), key="retry_jitter", default=True
+            ),
         )
 
         # Streaming flag: emit token-level streaming events when True
-        self.use_streaming: bool = bool(self.config.get("use_streaming", True))
+        self.use_streaming: bool = _coerce_bool(
+            self.config.get("use_streaming"), key="use_streaming", default=True
+        )
+
+        # Arbitrary litellm-native kwargs merged in last (after every other
+        # kwarg is computed, right before the streaming-vs-non-streaming
+        # split) -- litellm's entire **kwargs surface (e.g. `top_p`, `seed`,
+        # `frequency_penalty`) is otherwise unreachable through this provider.
+        _extra_raw = self.config.get("extra_request_params")
+        if _extra_raw is not None and not isinstance(_extra_raw, dict):
+            logger.warning(
+                "[PROVIDER] Config key 'extra_request_params' must be a "
+                "dict; got %s. Ignoring.",
+                type(_extra_raw).__name__,
+            )
+            _extra_raw = None
+        self.extra_request_params: dict[str, Any] = _extra_raw or {}
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -151,12 +312,12 @@ class LiteLLMProvider:
             },
             config_fields=[
                 ConfigField(
-                    id="model",
-                    display_name="Default Model",
-                    field_type="text",
-                    prompt="Default model (e.g. anthropic/claude-opus-4-6, openai/gpt-4o, gemini/gemini-2.5-flash)",
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="API key (defaults to provider env var, or 'not-needed' for local servers)",
                     required=False,
-                    default="anthropic/claude-opus-4-6",
+                    default="",
                 ),
                 ConfigField(
                     id="api_base",
@@ -167,12 +328,12 @@ class LiteLLMProvider:
                     default="",
                 ),
                 ConfigField(
-                    id="api_key",
-                    display_name="API Key",
-                    field_type="secret",
-                    prompt="API key (defaults to provider env var, or 'not-needed' for local servers)",
+                    id="default_model",
+                    display_name="Default Model",
+                    field_type="text",
+                    prompt="Default model (e.g. anthropic/claude-opus-4-6, openai/gpt-4o, gemini/gemini-2.5-flash)",
                     required=False,
-                    default="",
+                    default="anthropic/claude-opus-4-6",
                 ),
             ],
         )
@@ -454,6 +615,14 @@ class LiteLLMProvider:
         # Pass through response_format for structured output (e.g. JSON mode)
         if hasattr(request, "response_format") and request.response_format:
             litellm_kwargs["response_format"] = request.response_format
+
+        # Arbitrary litellm-native kwargs merged in LAST, right before the
+        # streaming-vs-non-streaming split -- an escape hatch for any
+        # litellm.acompletion() kwarg this provider doesn't expose a
+        # dedicated field for (e.g. top_p, seed, frequency_penalty). Can
+        # override any computed default above it.
+        if self.extra_request_params:
+            litellm_kwargs.update(self.extra_request_params)
 
         # Per-request streaming override (identity check, not truthiness)
         _meta = getattr(request, "metadata", None)
