@@ -88,6 +88,33 @@ openrouter/meta-llama/llama-3-70b
 bedrock/anthropic.claude-3-sonnet-20240229-v1:0
 ```
 
+### All config keys
+
+The setup wizard prompts for `api_key`, `api_base`, and `default_model`
+(reordered so credentials-first flows read naturally). Every key below is a
+fully supported config key -- set it directly in `settings.yaml`.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `default_model` | string | `anthropic/claude-opus-4-6` | Canonical key. `model` is accepted as a read-alias for backwards compatibility. |
+| `api_base` | string | `$LITELLM_API_BASE` | Base URL for self-hosted endpoints |
+| `api_key` | string | env-var / `"not-needed"` | |
+| `timeout` | float (seconds) | `300` | |
+| `drop_params` | bool | `True` | Let litellm silently drop params a given provider doesn't support |
+| `raw_debug` | bool | `False` | Attach a redacted copy of the litellm kwargs to the `llm:request` event |
+| `overloaded_delay_multiplier` | float | `10.0` | Extra backoff multiplier applied to "overloaded" errors |
+| `max_retries`, `min_retry_delay`, `max_retry_delay`, `retry_jitter` | various | `3` / `1.0` / `60.0` / `True` | **Client-side** retry policy (via amplifier-core's `retry_with_backoff`) -- separate from and not composed with litellm's own internal `num_retries` |
+| `use_streaming` | bool | `True` | Set `False` to force non-streaming completions |
+| `extra_request_params` | dict | `{}` | Merged last into the kwargs passed to `litellm.acompletion()` -- an escape hatch for any litellm-native kwarg not listed above (e.g. `top_p`, `seed`, `frequency_penalty`) |
+| `priority` | int | n/a | Read by the orchestrator's provider-selection logic, not by this module directly |
+
+Boolean and numeric keys accept native types or the string forms a config
+wizard writes (`"true"`/`"false"`, `"300"`); invalid numeric strings warn
+and fall back to the default rather than crashing at mount. Unrecognized
+config keys produce a mount-time warning (with a did-you-mean suggestion)
+rather than a silent no-op. The `debug` key (documented in older versions)
+is never wired to anything -- use `raw_debug`.
+
 ## How It Works
 
 1. Amplifier session requests an LLM completion
