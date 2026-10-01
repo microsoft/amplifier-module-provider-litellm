@@ -20,6 +20,8 @@ import uuid
 from typing import Any
 
 import litellm
+import httpx
+from amplifier_core.utils import redact_secrets
 from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
 from amplifier_core.llm_errors import (
     AccessDeniedError as KernelAccessDeniedError,
@@ -64,6 +66,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "timeout",
         "drop_params",
         "raw_debug",
+        "raw",
         "overloaded_delay_multiplier",
         "api_base",
         "api_key",
@@ -225,8 +228,15 @@ class LiteLLMProvider:
             or self.config.get("model")
             or "anthropic/claude-opus-4-6"
         )
-        self._timeout: float = _coerce_float(
-            self.config.get("timeout"), key="timeout", default=_DEFAULT_TIMEOUT
+        # None removes the model-work deadline; keep explicit limits opt-in.
+        # Do not pass bare None to LiteLLM: older versions substitute their own
+        # implicit timeout. An HTTPX policy preserves an unbounded read instead.
+        self._timeout: float | None = (
+            _coerce_float(
+                self.config["timeout"], key="timeout", default=_DEFAULT_TIMEOUT
+            )
+            if self.config.get("timeout") is not None
+            else None
         )
         self._drop_params: bool = _coerce_bool(
             self.config.get("drop_params"), key="drop_params", default=True
@@ -234,7 +244,9 @@ class LiteLLMProvider:
         # NOTE: 'debug' is intentionally not read here -- it was never wired
         # to anything (see _INERT_CONFIG_KEY_MESSAGES). Use raw_debug.
         self._raw_debug: bool = _coerce_bool(
-            self.config.get("raw_debug"), key="raw_debug", default=False
+            self.config.get("raw", self.config.get("raw_debug")),
+            key="raw",
+            default=False,
         )
         self._overloaded_delay_multiplier: float = _coerce_float(
             self.config.get("overloaded_delay_multiplier"),
@@ -579,6 +591,13 @@ class LiteLLMProvider:
                     },
                 )
 
+        request_options = kwargs.pop("request_options", None)
+        if request_options is not None:
+            from collections.abc import Mapping
+
+            if not isinstance(request_options, Mapping):
+                raise ValueError("request_options must be a mapping or None")
+            kwargs = {**request_options, **kwargs}
         model = request.model or kwargs.get("model", self.default_model)
         timeout = kwargs.get("timeout", self._timeout)
 
@@ -589,7 +608,11 @@ class LiteLLMProvider:
         litellm_kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "timeout": timeout,
+            "timeout": (
+                timeout
+                if timeout is not None
+                else httpx.Timeout(None, connect=5.0, pool=5.0)
+            ),
             "drop_params": self._drop_params,
         }
 
@@ -644,7 +667,8 @@ class LiteLLMProvider:
                     debug_kwargs = {
                         k: v for k, v in litellm_kwargs.items() if k not in ("api_key",)
                     }
-                    raw_str = json.dumps(debug_kwargs, default=str)
+                    request_event["raw"] = redact_secrets(debug_kwargs)
+                    raw_str = json.dumps(request_event["raw"], default=str)
                     if len(raw_str) > 16384:
                         raw_str = raw_str[:16384] + "...[truncated]"
                     request_event["raw_request"] = raw_str

@@ -178,3 +178,13 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Completion waits
+
+Healthy model requests have no default read/elapsed deadline. Explicit `timeout`
+configuration remains supported; connection and pool acquisition stay bounded.
+Cancellation propagates. Slow generation is not evidence of a broken service.
+Per-call options can be supplied in `request_options`; explicit keyword arguments
+take precedence over that mapping.
+
+`raw: true` records the full redacted SDK request on `llm:request.raw`; the legacy `raw_debug` option remains an alias. Capture is off by default.
