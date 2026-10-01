@@ -26,7 +26,7 @@ class TestProviderInit:
         p = LiteLLMProvider()
         assert p.name == "litellm"
         assert p.default_model == "anthropic/claude-opus-4-6"
-        assert p._timeout == 300.0
+        assert p._timeout is None
         assert p._drop_params is True
         assert p.coordinator is None
 
