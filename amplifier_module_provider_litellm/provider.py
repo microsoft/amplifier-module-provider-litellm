@@ -17,6 +17,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 import litellm
@@ -46,6 +47,7 @@ from amplifier_core.message_models import (
     Usage,
 )
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
+from ._model_listing import ModelFilters, listing_info
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,8 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "instance_id",
         "priority",
         "extra_request_params",
+        "model_filters",
+        "model_list",
     }
 )
 
@@ -221,6 +225,26 @@ class LiteLLMProvider:
         coordinator: ModuleCoordinator | None = None,
     ) -> None:
         self.config = config or {}
+        self._model_filters = ModelFilters.parse(self.config.get("model_filters", {}))
+        self._configured_models: tuple[str, ...] | None = None
+        if "model_list" in self.config:
+            entries = self.config["model_list"]
+            if not isinstance(entries, (list, tuple)):
+                raise ValueError("model_list must be a list of exact IDs or router model_name entries")
+            names = [
+                entry.get("model_name") if isinstance(entry, Mapping) else entry
+                for entry in entries
+            ]
+            if any(not isinstance(name, str) or not name.strip() for name in names):
+                raise ValueError("model_list entries require nonblank string IDs/model_name")
+            self._configured_models = tuple(names)
+        else:
+            # Preserve explicit manual selections as configured, not verified inventory.
+            explicit = self.config.get("default_model") or self.config.get("model")
+            if explicit is not None:
+                if not isinstance(explicit, str) or not explicit.strip():
+                    raise ValueError("configured model must be a nonblank string")
+                self._configured_models = (explicit,)
         self.coordinator = coordinator
         _warn_unknown_config_keys(self.config)
         self.default_model: str = (
@@ -350,96 +374,32 @@ class LiteLLMProvider:
             ],
         )
 
-    async def list_models(self) -> list[ModelInfo]:
-        """Return a list of known available models.
+    def get_model_list_info(self) -> dict[str, Any]:
+        return listing_info(
+            "configured" if self._configured_models is not None else "unsupported",
+            self._model_filters,
+        )
 
-        Checks which provider env vars are set and returns representative
-        models for each.  Best-effort — litellm supports far more models
-        than we enumerate here.
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """Return configured catalog entries, never inventory inferred from API keys.
+
+        This adapter calls litellm.acompletion, not an owned Router. api_base may
+        target any backend, so it is not proof of a proxy models endpoint either.
+        model_list is a manual snapshot, not a new routing configuration.
         """
-        models: list[ModelInfo] = []
-
-        # Provider -> (env_var, [(model_id, display_name, context_window, max_output)])
-        provider_models = [
-            (
-                "ANTHROPIC_API_KEY",
-                [
-                    ("anthropic/claude-opus-4-6", "Claude Opus 4", 200_000, 128_000),
-                    (
-                        "anthropic/claude-sonnet-4-20250514",
-                        "Claude Sonnet 4",
-                        200_000,
-                        64_000,
-                    ),
-                ],
-            ),
-            (
-                "OPENAI_API_KEY",
-                [
-                    ("openai/gpt-4o", "GPT-4o", 128_000, 16_384),
-                    ("openai/gpt-4o-mini", "GPT-4o Mini", 128_000, 16_384),
-                    ("openai/o3", "o3", 200_000, 100_000),
-                ],
-            ),
-            (
-                "GEMINI_API_KEY",
-                [
-                    ("gemini/gemini-2.5-pro", "Gemini 2.5 Pro", 1_000_000, 64_000),
-                    ("gemini/gemini-2.5-flash", "Gemini 2.5 Flash", 1_000_000, 64_000),
-                ],
-            ),
-            (
-                "XAI_API_KEY",
-                [
-                    ("xai/grok-3", "Grok 3", 131_072, 16_384),
-                ],
-            ),
-            (
-                "GROQ_API_KEY",
-                [
-                    (
-                        "groq/llama-3.3-70b-versatile",
-                        "Llama 3.3 70B (Groq)",
-                        128_000,
-                        32_000,
-                    ),
-                ],
-            ),
-            (
-                "OPENROUTER_API_KEY",
-                [
-                    ("openrouter/auto", "OpenRouter Auto", 200_000, 64_000),
-                ],
-            ),
-        ]
-
-        for env_var, model_list in provider_models:
-            if os.environ.get(env_var):
-                for mid, display, ctx, max_out in model_list:
-                    models.append(
-                        ModelInfo(
-                            id=mid,
-                            display_name=display,
-                            context_window=ctx,
-                            max_output_tokens=max_out,
-                            capabilities=["tools"],
-                        )
-                    )
-
-        # Always include default model if not already listed
-        if not any(m.id == self.default_model for m in models):
-            models.insert(
-                0,
-                ModelInfo(
-                    id=self.default_model,
-                    display_name=self.default_model,
-                    context_window=200_000,
-                    max_output_tokens=64_000,
-                    capabilities=["tools"],
-                ),
+        policy = self._model_filters if filters is None else ModelFilters.parse(filters)
+        if self._configured_models is None:
+            raise KernelProviderUnavailableError(
+                "LiteLLM inventory is unavailable. Configure model_list from your "
+                "router/proxy or enter an exact default_model. API keys do not establish inventory.",
+                provider=self.name, retryable=False,
             )
-
-        return models
+        return [
+            ModelInfo(id=mid, display_name=mid, context_window=0, max_output_tokens=0)
+            for mid in policy.select(list(self._configured_models))
+        ]
 
     # ------------------------------------------------------------------
     # Tool sequence repair

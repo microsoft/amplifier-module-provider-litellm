@@ -84,7 +84,8 @@ class TestProviderInfo:
 
 class TestListModels:
     @pytest.mark.asyncio
-    async def test_lists_models_for_set_env_vars(self):
+    async def test_env_keys_do_not_establish_inventory(self):
+        from amplifier_core.llm_errors import ProviderUnavailableError
         controlled_env = {
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
@@ -93,11 +94,9 @@ class TestListModels:
         controlled_env["OPENAI_API_KEY"] = "test"
         with patch.dict(os.environ, controlled_env, clear=True):
             p = LiteLLMProvider()
-            models = await p.list_models()
-            ids = [m.id for m in models]
-            assert any("anthropic" in mid for mid in ids)
-            assert any("openai" in mid for mid in ids)
-            assert not any("gemini" in mid for mid in ids)
+            with pytest.raises(ProviderUnavailableError):
+                await p.list_models()
+            assert p.get_model_list_info()["source"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_always_includes_default_model(self):

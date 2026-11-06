@@ -76,6 +76,30 @@ litellm reads standard provider env vars:
 
 ### Model Names
 
+#### Truthful configured listing
+
+`list_models(*, filters=None)` no longer invents representative models from API-key
+environment variables. This adapter owns neither a LiteLLM Router nor a guaranteed
+proxy model-list endpoint: `api_base` may be any supported backend.
+
+Supply `model_list` as exact IDs, or router-style objects with `model_name`:
+`[{"model_name": "production-chat"}, "Team/Custom:Q4"]`. This is a configured
+catalog snapshot, **not** new Router setup or verified account entitlement. No
+prefix is added or stripped. If omitted, an explicitly configured
+`default_model`/`model` is the manual configured view. Without either,
+listing raises a non-retryable `ProviderUnavailableError`; the host should offer
+manual exact entry. `model_list: []` is a successful empty configured view.
+`get_model_list_info()` reports `source: configured` or `unsupported`, never
+`provider-api` for these local settings.
+
+All configured entries are included by default. `config.model_filters` snapshots
+`include`, `exclude` and `hide_dated`. An explicit mapping replaces defaults:
+`{}` is unfiltered, `include: []` includes none, and exclude wins.
+Case-insensitive OS-independent globs preserve exact IDs. `hide_dated` only hides
+a YYYY-MM-DD suffix when its undated alias is selected. Token limits remain
+unknown (zero), capabilities empty. Existing LiteLLM inference prefixes, request
+parameters and explicitly selected hidden models are unchanged.
+
 Use litellm's model naming convention:
 
 ```
