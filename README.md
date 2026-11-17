@@ -149,6 +149,52 @@ is never wired to anything -- use `raw_debug`.
 
 No bridge services, no proxy servers, no credential duplication. Just env vars and a model name.
 
+### Image inputs
+
+Core `ImageBlock` inputs are converted to LiteLLM `image_url` parts, not Python
+representations. Inline PNG/JPEG/GIF/WebP base64 is validated and preserved
+byte-for-byte; it is not resized. HTTP(S) image URLs are preserved (the selected
+SDK/backend may fetch them). File paths, malformed sources and unsupported
+formats become explicit unavailable text; later text blocks are retained.
+
+Image support depends on **both the model and the message position**:
+
+| Position / route | Behavior |
+| --- | --- |
+| Ordinary user image, model recognized by LiteLLM `supports_vision` | Native image part |
+| Tool result, direct Anthropic adapter, recognized vision model, LiteLLM >= 1.53.2 | Native image inside the original `tool_result`, retaining its call ID |
+| OpenAI Chat Completions tool result | Unavailable text in the original tool slot; that API permits text, not image tool parts |
+| Other tool routes, old SDKs or unknown model metadata | Explicit **not verified** unavailable text in the original slot |
+
+`Message(role="tool", content=[TextBlock(...), ImageBlock(...)], tool_call_id=...)`
+and Core `ToolResultBlock.output` lists/content envelopes are supported, including
+persisted dictionaries. Surrounding text, failure metadata and tool-call pairing
+are preserved. No image is moved into a fabricated user utterance. Final
+`extra_request_params` model/backend overrides participate in the support check;
+an explicit native `messages` override remains the caller's transport escape hatch.
+
+This is intentionally not a universal tool-vision claim: Bedrock Converse,
+Gemini multimodal function responses and OpenAI Responses have distinct
+adapter/version/model requirements and are not qualified tool-image routes here.
+No endpoint is silently switched. An unknown custom model may therefore need an
+SDK metadata update before images can be admitted.
+
+Request diagnostics omit image sources on detached copies **before** hooks run.
+SDK errors for image-bearing requests retain their error category/status/retry
+policy but omit potentially echoed payload bodies and exception chains. Raw
+response capture for those requests is also omitted. This does not change the
+original stored history or the bytes sent to a supported transport.
+
+The offline tests exercise real LiteLLM Anthropic conversion and an HTTPX
+mock-transport request with a fake key. They prove payload shape and byte/call-ID
+preservation, **not live server/model acceptance**.
+
+Protocol references:
+[LiteLLM's tool-image repair](https://github.com/BerriAI/litellm/pull/6965),
+[the 1.53.2 converter](https://github.com/BerriAI/litellm/blob/v1.53.2/litellm/llms/prompt_templates/factory.py),
+[Anthropic tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls),
+[OpenAI Chat tool-message schema](https://github.com/openai/openai-python/blob/main/src/openai/types/chat/chat_completion_tool_message_param.py).
+
 ## Use with OpenClaw
 
 When Amplifier runs as a sidecar inside OpenClaw, all of OpenClaw's configured API keys are available as environment variables. This means:
