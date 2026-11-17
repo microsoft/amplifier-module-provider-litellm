@@ -17,6 +17,7 @@ import logging
 import os
 import time
 import uuid
+from importlib.metadata import version
 from collections.abc import Mapping
 from typing import Any
 
@@ -48,6 +49,13 @@ from amplifier_core.message_models import (
 )
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from ._model_listing import ModelFilters, listing_info
+from ._images import (
+    block_dict,
+    contains_image,
+    content_parts,
+    diagnostic_copy,
+    tool_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +482,15 @@ class LiteLLMProvider:
                 if tc_id:
                     tool_results.add(tc_id)
 
+            # Core also represents results as typed blocks in a message.
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    data = block_dict(block)
+                    if isinstance(data, dict) and data.get("type") == "tool_result":
+                        tc_id = data.get("tool_call_id")
+                        if tc_id:
+                            tool_results.add(tc_id)
+
         # Exclude IDs that have already been repaired to prevent infinite loops
         return [
             (msg_idx, call_id, name)
@@ -562,7 +579,7 @@ class LiteLLMProvider:
         timeout = kwargs.get("timeout", self._timeout)
 
         # Build litellm params
-        messages = _to_litellm_messages(request)
+        messages: list[dict[str, Any]] = []
         tools = _to_litellm_tools(request) if request.tools else None
 
         litellm_kwargs: dict[str, Any] = {
@@ -607,6 +624,31 @@ class LiteLLMProvider:
         if self.extra_request_params:
             litellm_kwargs.update(self.extra_request_params)
 
+        # Escape-hatch routing overrides must participate in image admission.
+        # Do not translate for one backend and then send to another.
+        if "messages" not in self.extra_request_params:
+            messages = _to_litellm_messages(
+                request,
+                model=litellm_kwargs["model"],
+                custom_llm_provider=litellm_kwargs.get("custom_llm_provider"),
+            )
+            litellm_kwargs["messages"] = messages
+        image_request = contains_image(request.messages) or contains_image(
+            litellm_kwargs.get("messages", [])
+        )
+
+        def error_message(exc: Exception) -> str:
+            # SDK/server errors can echo the whole submitted request, including
+            # bare base64. Do not put that body into exceptions, logs or events.
+            if image_request:
+                return f"{type(exc).__name__}: image request failed (payload omitted)"
+            body = getattr(exc, "body", None)
+            return (
+                json.dumps(body, default=str)
+                if body is not None
+                else (str(exc) or f"{type(exc).__name__}: (no message)")
+            )
+
         # Per-request streaming override (identity check, not truthiness)
         _meta = getattr(request, "metadata", None)
         _use_streaming = self.use_streaming
@@ -627,7 +669,7 @@ class LiteLLMProvider:
                     debug_kwargs = {
                         k: v for k, v in litellm_kwargs.items() if k not in ("api_key",)
                     }
-                    request_event["raw"] = redact_secrets(debug_kwargs)
+                    request_event["raw"] = redact_secrets(diagnostic_copy(debug_kwargs))
                     raw_str = json.dumps(request_event["raw"], default=str)
                     if len(raw_str) > 16384:
                         raw_str = raw_str[:16384] + "...[truncated]"
@@ -651,16 +693,16 @@ class LiteLLMProvider:
                 return await litellm.acompletion(**litellm_kwargs)
             except litellm.AuthenticationError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelAuthenticationError(
                     msg,
                     provider="litellm",
                     status_code=401,
                 ) from e
-            except litellm.PermissionDeniedError as e:
+            except getattr(litellm, "PermissionDeniedError", ()) as e:
                 body = getattr(e, "body", None)
                 status = getattr(e, "status_code", 403) or 403
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 # CDN/proxy 403: body is None (no JSON parsed from HTML challenge)
                 if status == 403 and body is None:
                     logger.warning(
@@ -680,7 +722,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.RateLimitError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelRateLimitError(
                     msg,
                     provider="litellm",
@@ -690,7 +732,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.ContextWindowExceededError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelContextLengthError(
                     msg,
                     provider="litellm",
@@ -698,7 +740,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.ContentPolicyViolationError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelContentFilterError(
                     msg,
                     provider="litellm",
@@ -706,7 +748,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.BadRequestError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelInvalidRequestError(
                     msg,
                     provider="litellm",
@@ -717,7 +759,7 @@ class LiteLLMProvider:
                 # ServiceUnavailableError. Detect overloaded condition to
                 # apply a longer backoff via delay_multiplier.
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 status = getattr(e, "status_code", 503) or 503
                 is_overloaded = status == 529 or "overloaded" in str(e).lower()
                 multiplier = self._overloaded_delay_multiplier if is_overloaded else 1.0
@@ -731,7 +773,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.NotFoundError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelNotFoundError(
                     msg,
                     provider="litellm",
@@ -739,7 +781,7 @@ class LiteLLMProvider:
                 ) from e
             except litellm.APIConnectionError as e:
                 body = getattr(e, "body", None)
-                msg = json.dumps(body, default=str) if body is not None else str(e)
+                msg = error_message(e)
                 raise KernelNetworkError(
                     msg,
                     provider="litellm",
@@ -754,12 +796,7 @@ class LiteLLMProvider:
             except KernelLLMError:
                 raise  # Already translated
             except Exception as e:
-                body = getattr(e, "body", None)
-                error_msg = (
-                    json.dumps(body, default=str)
-                    if body is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
+                error_msg = error_message(e)
                 raise KernelLLMError(
                     error_msg,
                     provider="litellm",
@@ -800,14 +837,14 @@ class LiteLLMProvider:
                     stream = await litellm.acompletion(**streaming_kwargs)
                 except litellm.AuthenticationError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelAuthenticationError(
                         msg, provider="litellm", status_code=401
                     ) from e
-                except litellm.PermissionDeniedError as e:
+                except getattr(litellm, "PermissionDeniedError", ()) as e:
                     body = getattr(e, "body", None)
                     status = getattr(e, "status_code", 403) or 403
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     if status == 403 and body is None:
                         logger.warning(
                             "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
@@ -821,7 +858,7 @@ class LiteLLMProvider:
                     ) from e
                 except litellm.RateLimitError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelRateLimitError(
                         msg,
                         provider="litellm",
@@ -831,25 +868,25 @@ class LiteLLMProvider:
                     ) from e
                 except litellm.ContextWindowExceededError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelContextLengthError(
                         msg, provider="litellm", status_code=400
                     ) from e
                 except litellm.ContentPolicyViolationError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelContentFilterError(
                         msg, provider="litellm", status_code=400
                     ) from e
                 except litellm.BadRequestError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelInvalidRequestError(
                         msg, provider="litellm", status_code=400
                     ) from e
                 except litellm.ServiceUnavailableError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     status = getattr(e, "status_code", 503) or 503
                     is_overloaded = status == 529 or "overloaded" in str(e).lower()
                     multiplier = self._overloaded_delay_multiplier if is_overloaded else 1.0
@@ -863,13 +900,13 @@ class LiteLLMProvider:
                     ) from e
                 except litellm.NotFoundError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelNotFoundError(
                         msg, provider="litellm", status_code=404
                     ) from e
                 except litellm.APIConnectionError as e:
                     body = getattr(e, "body", None)
-                    msg = json.dumps(body, default=str) if body is not None else str(e)
+                    msg = error_message(e)
                     raise KernelNetworkError(
                         msg, provider="litellm", retryable=True
                     ) from e
@@ -882,12 +919,7 @@ class LiteLLMProvider:
                 except KernelLLMError:
                     raise  # Already translated
                 except Exception as e:
-                    body = getattr(e, "body", None)
-                    error_msg = (
-                        json.dumps(body, default=str)
-                        if body is not None
-                        else (str(e) or f"{type(e).__name__}: (no message)")
-                    )
+                    error_msg = error_message(e)
                     raise KernelLLMError(
                         error_msg, provider="litellm", retryable=True
                     ) from e
@@ -1103,10 +1135,14 @@ class LiteLLMProvider:
                                 "request_id": request_id,
                                 "error": {
                                     "type": type(e).__name__,
-                                    "msg": str(e),
+                                    "msg": error_message(e),
                                 },
                             },
                         )
+                    if image_request:
+                        raise KernelLLMError(
+                            error_message(e), provider="litellm", retryable=False
+                        ) from None
                     raise
 
                 # ---- Build final ChatResponse ----
@@ -1185,6 +1221,9 @@ class LiteLLMProvider:
 
             except KernelLLMError as e:
                 # Connection-time errors land here; emit llm:response error
+                if image_request:
+                    e.__cause__ = e.__context__ = None
+                    e.__suppress_context__ = True
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 logger.error("[PROVIDER] litellm streaming error: %s", str(e))
                 if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -1250,7 +1289,11 @@ class LiteLLMProvider:
                             if hasattr(response, "model_dump")
                             else str(response)
                         )
-                        raw_str = json.dumps(raw, default=str)
+                        raw_str = (
+                            "[image request response omitted]"
+                            if image_request
+                            else json.dumps(diagnostic_copy(raw), default=str)
+                        )
                         # Truncate to prevent event bloat (16KB max)
                         if len(raw_str) > 16384:
                             raw_str = raw_str[:16384] + "...[truncated]"
@@ -1262,6 +1305,9 @@ class LiteLLMProvider:
             return _from_litellm_response(response)
 
         except KernelLLMError as e:
+            if image_request:
+                e.__cause__ = e.__context__ = None
+                e.__suppress_context__ = True
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error("[PROVIDER] litellm error: %s", str(e))
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -1296,19 +1342,87 @@ class LiteLLMProvider:
 # ---------------------------------------------------------------------------
 
 
-def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
+def _image_support(
+    model: str | None, custom_llm_provider: str | None
+) -> tuple[bool, bool]:
+    """Vision metadata is not a guarantee of tool-position image support.
+
+    Only the Anthropic adapter's qualified tool-result translation is enabled.
+    OpenAI chat tool messages are text-only even on vision models. Unknown
+    backends/SDKs fail truthfully in the original slot, never as a new user turn.
+    """
+    if not isinstance(model, str):
+        return False, False
+    try:
+        _, backend, _, _ = litellm.get_llm_provider(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+        vision = litellm.supports_vision(model=model, custom_llm_provider=backend) is True
+        sdk_version = tuple(int(v) for v in version("litellm").split(".")[:3])
+        return vision, vision and backend == "anthropic" and sdk_version >= (1, 53, 2)
+    except Exception:
+        # Metadata lookup is local and cannot establish support for aliases.
+        return False, False
+
+
+def _to_litellm_messages(
+    request: ChatRequest,
+    *,
+    model: str | None = None,
+    custom_llm_provider: str | None = None,
+) -> list[dict[str, Any]]:
     """Convert ChatRequest messages to litellm format (OpenAI-compatible)."""
+    vision, tool_images = _image_support(model or request.model, custom_llm_provider)
     messages = []
     for msg in request.messages:
         role = msg.role
         content = msg.content
+
+        # Some Core histories wrap a result block inside a tool message, with
+        # adjacent text. Keep that one tool slot intact and take its nested ID
+        # when the outer message has none.
+        if role == "tool" and isinstance(content, list):
+            results = [
+                block_dict(b) for b in content
+                if isinstance(block_dict(b), dict)
+                and block_dict(b).get("type") == "tool_result"
+            ]
+            if len(results) == 1:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id or results[0].get("tool_call_id", ""),
+                    "content": tool_content(content, images=tool_images),
+                })
+                continue
+
+        if isinstance(content, list) and any(
+            isinstance(block_dict(b), dict)
+            and block_dict(b).get("type") == "tool_result"
+            for b in content
+        ):
+            # Unwrap only the Core result schema. Preserve IDs and sequence,
+            # without copying pixels into an invented user message.
+            for block in content:
+                data = block_dict(block)
+                if isinstance(data, dict) and data.get("type") == "tool_result":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": data.get("tool_call_id", ""),
+                        "content": tool_content(data.get("output", data.get("content", "")), images=tool_images),
+                    })
+                else:
+                    messages.append({
+                        "role": role,
+                        "content": content_parts(data, images=vision and role == "user"),
+                    })
+            continue
 
         if role == "tool":
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": getattr(msg, "tool_call_id", "") or "",
-                    "content": content if isinstance(content, str) else str(content),
+                    "content": tool_content(content, images=tool_images),
                 }
             )
             continue
@@ -1316,7 +1430,7 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
         # Developer/system context messages -> user messages with XML wrapping
         # (same pattern as anthropic and vllm providers)
         if role == "developer":
-            content_str = content if isinstance(content, str) else str(content)
+            content_str = tool_content(content, images=False)
             messages.append(
                 {
                     "role": "user",
@@ -1336,10 +1450,24 @@ def _to_litellm_messages(request: ChatRequest) -> list[dict[str, Any]]:
             # expects plain dicts or strings.
             serialized = []
             for block in content:
-                if hasattr(block, "model_dump"):
+                data = block_dict(block)
+                if isinstance(data, dict) and data.get("type") in {"image", "image_url", "input_image"}:
+                    serialized.extend(content_parts(data, images=vision and role == "user"))
+                elif isinstance(data, dict) and data.get("type") == "tool_call" and role == "assistant":
+                    entry.setdefault("tool_calls", []).append({
+                        "id": data.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": data.get("name", ""),
+                            "arguments": json.dumps(data.get("input", {})),
+                        },
+                    })
+                elif contains_image(data):
+                    serialized.extend(content_parts(data, images=False))
+                elif hasattr(block, "model_dump"):
                     serialized.append(block.model_dump())
                 elif isinstance(block, dict):
-                    serialized.append(block)
+                    serialized.append(dict(block))
                 else:
                     serialized.append(str(block))
             entry["content"] = serialized
